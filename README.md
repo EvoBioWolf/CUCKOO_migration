@@ -21,8 +21,8 @@ Run MSMC crosscoalescent and MSMC-IM, using raw gVCFs with basic filtering for i
 ### `/admixture/`
 Run ADMIXTURE and evalAdmix for plotting genetic tesselations across space. 
 
-### `/pi_tajima/`
-Estimating π and Tajima's D on the n = 40 subsetted samples used for demographic inference.  
+### `/reconstruction/`
+Ancestral reconstructions of overwintering and migratory route. 
 
 ### `/temperature_periods`
 [Kawamura 2007](https://www.ncei.noaa.gov/access/metadata/landing-page/bin/iso?id=noaa-icecore-6076) Ice Core Temperature data for identifying warm / cold periods. 
