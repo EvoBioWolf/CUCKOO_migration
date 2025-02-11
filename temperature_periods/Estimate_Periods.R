@@ -1,9 +1,8 @@
 .libPaths('~/mambaforge/envs/R/lib/R/library')
-setwd('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/msmc/unrelated_chyiyin/crosscoal/output')
 library(tidyverse)
 
 #import ice core data 
-icecore = read_tsv('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/figures/Ice_Temperature_Reconstructions_Kawamura_NOAA-6076.txt')
+icecore = read_tsv('Ice_Temperature_Reconstructions_Kawamura_NOAA-6076.txt')
 icecore = icecore %>% dplyr::rename(time = TopAge)
 
 # Hot times, recent 
@@ -66,7 +65,7 @@ ice_plot <- icecore %>%
   theme_test(base_size=10)
 ice_plot
 
-png('~/merondun/cuculus_migration/figures/WarmCold_Periods.png',units='in',res=300,height=2,width=3.5)
-pdf('~/merondun/cuculus_migration/figures/WarmCold_Periods.pdf',height=2,width=3.5)
+png('WarmCold_Periods.png',units='in',res=300,height=2,width=3.5)
+pdf('WarmCold_Periods.pdf',height=2,width=3.5)
 ice_plot
 dev.off()

@@ -25,11 +25,11 @@ Using equal rates deterministic approach.
 
 For residency, including tip points:
 
-[tips](20250115_ReconstructionER-Cuculiformes_Residency-TIPS.png) 
+![tips](20250115_ReconstructionER-Cuculiformes_Residency-TIPS.png) 
 
 And for route:
 
-[route](20250115_ReconstructionER-Cuculiformes_Route-TIPS.png)
+![route](20250115_ReconstructionER-Cuculiformes_Route-TIPS.png)
 
 
 
