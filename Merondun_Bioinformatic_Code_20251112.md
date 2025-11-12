@@ -523,6 +523,293 @@ dev.off()
 
 ```
 
+## Plot Seasonal Tracks & NDVI
+
+```
+### Plot NDVI and Tracks
+setwd('~/EvoBioWolf/CUCKOO_migration/')
+.libPaths('~/r_libs/')
+library(tidyverse)
+library(RColorBrewer)
+library(meRo)
+library(sf)
+library(rworldmap)
+library(ggnewscale)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(DHARMa)
+library(ggpubr)
+library(giscoR)
+
+set.seed(1)
+
+#read in metadata
+md = read_tsv('Full_Metadata.txt')
+
+# Change optatus east to just gray
+md <- md %>% mutate(Population = ifelse(Population == 'COE',NA,Population),
+                    PopColor = ifelse(Population=='COE','grey60',PopColor))
+
+cols <- md %>% distinct(Population,PopColor) %>% na.omit %>% arrange(desc(Population)) %>% mutate(Population = gsub('COW','CO',Population))
+
+##### Plot Tracking data #####
+# Read spatial data, filter according to Maire's filtering
+final.locations <- read_csv('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/03-BoD-deaths-removed-no-NDVI.csv')
+
+# Calculate distance between each point
+final.locations <- final.locations %>%
+  group_by(tag.local.identifier) %>%
+  mutate(long.to.sf = location.long,
+         lat.to.sf = location.lat,
+         timestamp = as.POSIXct(timestamp, format = "%m/%d/%Y %H:%M")) %>%
+  st_as_sf(coords = c("long.to.sf", "lat.to.sf"), crs = 4326) %>%
+  arrange(tag.local.identifier, timestamp) %>%
+  mutate(dist = c(0,as.numeric(st_distance(geometry[-1], geometry[-n()], by_element = T))/1000),
+         duration_hr = c(NA, as.numeric(difftime(timestamp[-1], timestamp[-n()], units = "hours")))) %>%
+  st_drop_geometry()
+
+# distance
+ggplot(final.locations, aes(x = dist)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "grey30") +
+  #scale_x_continuous(limits = c(0, 200)) +
+  theme_bw()
+
+# duration
+ggplot(final.locations, aes(x = duration_hr)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "grey30") +
+  #scale_x_continuous(limits = c(0, 200)) +
+  theme_bw()
+
+# raw: HMMs
+locs <- final.locations %>% 
+  ungroup %>% 
+  mutate(
+    timestamp = as_datetime(timestamp),
+    DT = as_datetime(timestamp),
+    month = month(DT),
+    year = year(DT),
+    Year_Num = cumsum(month(DT) == 11 & lag(month(DT), default = 10) != 11),) %>%
+  dplyr::select(
+    ID = tag.local.identifier,
+    Long = location.long,
+    Lat = location.lat,
+    timestamp,
+    seg_dist = dist,
+    duration_hr,
+    mean_NDVI,
+    Species = individual.taxon.canonical.name,
+    Wolf,
+    Route,
+    month,
+    year,
+    Year_Num
+  ) %>%
+  add_count(ID, name = "n_locs") %>%
+  filter(n_locs >= 10) %>%
+  filter(!str_detect(Species, "satura")) %>%
+  arrange(ID, timestamp) %>% dplyr::select(-n_locs)
+
+# assign new ID if furthe than X away 
+gap_hours <- 336
+
+m_f1 <- locs %>%
+  arrange(ID, timestamp) %>%
+  group_by(ID) %>%
+  mutate(
+    # mark the current point as the start of a new segment if gap from previous > threshold
+    gap_flag = duration_hr > gap_hours,
+    gap_flag = replace_na(gap_flag, FALSE),
+    seg_id   = 1 + cumsum(gap_flag),                 # segments: 1,2,3,...
+    track_ID   = paste0(ID, "_seg", seg_id)
+  ) %>%
+  ungroup() %>% dplyr::select(-gap_flag,-seg_id)
+
+length(unique(m_f1$track_ID))
+
+# check
+ggplot() +
+  geom_path(m_f1, mapping = aes(Long, Lat, group = track_ID))
+
+# retain only the largest contiugous track per sample 
+largest <- m_f1 %>% add_count(track_ID, name = "n_locs") %>% group_by(ID) %>% slice_max(n_locs,with_ties = F) %>% pull(track_ID)
+one_per_sample <- m_f1 %>% filter(track_ID %in% largest)
+ggplot() +
+  geom_path(one_per_sample, mapping = aes(Long, Lat, group = track_ID))
+one_per_sample %>% count(ID,track_ID)
+one_per_sample %>% count(ID,month,year) %>% count(ID) %>% ggplot(aes(y=n))+geom_histogram()+theme_bw()
+
+# do we have any small tiny tracks? remove 
+dtrack <- one_per_sample %>% 
+  group_by(ID) %>% 
+  drop_na(c(seg_dist,duration_hr)) %>% 
+  summarize(total_dist = sum(seg_dist),
+            total_time = sum(duration_hr)) 
+
+# filter for at least a month of data and at least 500 km traveled 
+dtrack %>%
+  ggplot(aes(y=total_dist))+
+  geom_histogram()
+small_tracks <- dtrack %>% filter(total_time < 720 | total_dist < 500)
+one_per_sample_long <- one_per_sample %>%
+  anti_join(small_tracks, by = "ID")
+length(unique(one_per_sample$ID)); length(unique(one_per_sample_long$ID))
+
+##### Assign CCW / CCE / CO - 3 pop #####
+routes <- one_per_sample_long %>%
+  filter(month == 6 | month == 7 | month == 8) %>% 
+  group_by(ID,Species) %>% 
+  summarize(Long = mean(Long), Lat = mean(Lat)) %>% 
+  mutate(Direction = ifelse( Species == 'Cuculus canorus' & Long >= 95, 'CCE',
+                             ifelse( Species == 'Cuculus canorus','CCW', 'CO')))%>% 
+  dplyr::select(-c(Long,Lat))
+
+# check unclassified
+left_join(one_per_sample_long, routes) %>% filter(is.na(Direction)) %>% 
+  ggplot() +
+  geom_path(mapping = aes(Long, Lat, group = track_ID, col = ID))
+
+# BUT, some indivduals dont' have track data in June July, manually inspect and assign - they are all western
+tracks_routes <- left_join(one_per_sample_long, routes) %>%
+  mutate(Direction = ifelse(!is.na(Direction),Direction,
+                            ifelse(ID == '196315','CCE',
+                                   ifelse(Species == 'Cuculus canorus','CCW','CO'))),
+         Season = case_when(
+           month %in% c(5,6) & Direction == 'CCW'  ~ "Summer",
+           month %in% c(7,8,9,10) & Direction == 'CCW' ~ "Autumn",
+           month %in% c(11,12,1,2) & Direction == 'CCW'  ~ "Winter",
+           month %in% c(3,4) & Direction == 'CCW'  ~ "Spring",
+           month %in% c(6,7) & grepl('CCE|CO',Direction) ~ "Summer",
+           month %in% c(8,9,10,11) & grepl('CCE|CO',Direction)  ~ "Autumn",
+           month %in% c(12,1) & grepl('CCE|CO',Direction)  ~ "Winter",
+           month %in% c(2,3,4,5) & grepl('CCE|CO',Direction)  ~ "Spring",
+           TRUE ~ "Other"
+         ))
+
+tracks_routes %>% 
+  ggplot() +
+  geom_path(mapping = aes(Long, Lat, group = track_ID, col = Direction))
+
+# Confirm routes
+colp <- cols$PopColor
+names(colp) <- cols$Population
+tracks_routes %>% 
+  ggplot() +
+  geom_path(mapping = aes(Long, Lat, group = track_ID, col = Direction)) +
+  scale_color_manual(values=colp)
+
+# Only analyze samples where we have at least 10 points in summer and 10 points in winter
+min_pts <- 10  # only analyze if at least this many occurrences 
+
+# counts table - no sf ops here
+season_counts <- tracks_routes %>%
+  group_by(ID, year, Direction, Season) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  filter(Season %in% c("Summer","Winter"))
+
+# targets: one row per ID-year-season if enough points
+breeding_targets <- season_counts %>%
+  filter(Season == "Summer", n >= min_pts) %>%
+  transmute(ID, year, Direction, Season = "Breeding")
+
+winter_targets <- season_counts %>%
+  filter(Season == "Winter", n >= min_pts) %>%
+  transmute(ID, year, Direction, Season = "Overwintering")
+
+targets <- bind_rows(breeding_targets, winter_targets) %>% 
+  arrange(ID, year, Season) %>% 
+  add_count(ID) %>% 
+  filter(n > 1) %>%
+  group_by(ID) %>%
+  filter(all(c("Breeding", "Overwintering") %in% unique(Season))) %>%
+  ungroup()
+
+filt_track <- tracks_routes %>% filter(ID %in% unique(targets$ID))
+filt_track %>% distinct(ID,Direction) %>% count(Direction)
+
+# Just first weeks of Jan and June
+simp <- filt_track %>% 
+  mutate(
+    Season = case_when(
+      month == 6 & lubridate::day(timestamp) <= 7 ~ "Breeding",
+      month == 1 & lubridate::day(timestamp) <= 7 ~ "Overwintering",
+      TRUE ~ NA_character_
+    )) %>%
+  filter(!is.na(Season))
+
+mod_dat <- simp
+m1 <- lmer(mean_NDVI ~ Season * Direction + (1 | ID), data = mod_dat)
+sim_res <- simulateResiduals(m1)
+plot(sim_res)  # residuals vs fitted, QQ, etc.
+plotResiduals(sim_res,rank=TRUE)
+testDispersion(sim_res)
+# yep pretty much follows 
+
+summary(m1)
+emm <- emmeans(m1, ~ Direction | Season)
+emm_df <- as.data.frame(emm)
+
+# Pairwise comparisons, Bonferroni-adjusted
+contrast_results <- contrast(emm, method = "pairwise", adjust = "bonferroni")
+contrast_df <- as.data.frame(contrast(emmeans(m1, ~ Direction | Season),
+                                      method = "pairwise",
+                                      adjust = "bonferroni"))
+contrast_df
+
+
+# For signifncace bars
+direction_offsets <- c(CCW = -0.27, CCE = 0, CO = 0.27)  # adjust if bars spaced differently
+contrast_df$Season <- factor(contrast_df$Season, levels=c('Overwintering','Breeding'))
+sig_df <- contrast_df %>%
+  mutate(
+    group1 = sub(" -.*", "", contrast),
+    group2 = sub(".*- ", "", contrast),
+    p.adj.signif = ifelse(p.value < 0.01, "*", "ns"),
+    y.position = case_when(
+      contrast == "CCE - CCW" ~ 0.46,
+      contrast == "CCE - CO"  ~ 0.48,
+      contrast == "CCW - CO"  ~ 0.5
+    ),
+    # numeric Season positions
+    xnum = as.numeric(factor(Season)),
+    # x start/end points for the bracket lines
+    xmin = xnum + direction_offsets[group1],
+    xmax = xnum + direction_offsets[group2]
+  )
+
+# plot full model 
+emm_df <- as.data.frame(emmeans(m1, ~ Season * Direction))
+emm_df$Direction <- factor(emm_df$Direction,levels=c('CCW','CCE','CO'))
+emm_df$Season <- factor(emm_df$Season, levels=c('Overwintering','Breeding'))
+n <- ggplot(emm_df, aes(x = Season, y = emmean, fill = Direction)) +
+  geom_col(position = position_dodge(width = 0.8), color = "grey20") +
+  geom_errorbar(aes(ymin = lower.CL, ymax = upper.CL),
+                position = position_dodge(width = 0.8),
+                width = 0.2) +
+  theme_bw(base_size = 12) +
+  scale_fill_manual(values=colp)+
+  labs(
+    y = "Predicted mean NDVI (±95% CI)",
+    x = "Phase",
+    fill = "Route"
+  )  + 
+  stat_pvalue_manual(
+    data = sig_df,
+    size = 4,
+    label = "p.adj.signif",
+    xmin = "xmin", xmax = "xmax",
+    y.position = "y.position",
+    tip.length = 0.01,
+    bracket.size = 0.4,
+    hide.ns = FALSE
+  )
+n
+
+ggsave('figures/20251112_NDVI_JanJune.pdf',height=2.5,width=5,n)
+```
+
+
+
 ## Plot Spherical
 
 Plotting on a spherical globe is easy using this [code](https://stackoverflow.com/questions/70756215/plot-geodata-on-the-globe-perspective-in-r). 
@@ -713,8 +1000,6 @@ ggsave('figures/20241218_Spherical-Tracks-Filtered-CanOpt-3Pop.pdf',
 
 saveRDS(tracks, "/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/tracks_data.rds")
 ```
-
-![image-20241022163640949](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20241022163640949.png)
 
 ### Spherical Satellite
 
@@ -907,9 +1192,9 @@ ggsave('figures/20241218_Spherical-Tracks-Filtered-CanOpt-3Pop.pdf',
 saveRDS(tracks, "/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/tracks_data.rds")
 
 
-### Satelltie
+### Satelite
 library(ggmap)
-register_google(key = "AIzaSyDzjCgFf9hhFIBkVJ4tAyy6cjjq9BjmG4U")
+register_google(key = "SECRET")
 
 # Canorus 
 can_flat <- tracks %>% 
@@ -1025,14 +1310,15 @@ ggsave('Cuckoos sounds/20250115_PCA-Sounds-CanOpt.pdf',units='in',dpi=300,height
 # Plot Hindcasting
 
 ```R
-setwd('C:/Users/herit/Dropbox/CUCKOO_migration/Manuscript/Figures/Figure_3_Hindcasting/Files for Fig 3/')
+setwd('C:/Users/herit/Dropbox/CUCKOO_migration/Manuscript/Figures/Figure_3_Hindcasting/')
 library(tidyverse)
 library(readxl)
 library(ggforce)
 library(RColorBrewer)
+library(ggpubr)
 
 # Load the Excel file, skipping the first row
-df <- read_excel("BreedWinterOverlap3.xlsx",sheet = 'R_Input') %>% as_tibble()
+df <- read_excel("GapData.xlsx",sheet = 'R_Input') %>% as_tibble()
 df <- df %>% mutate(year_ka = year / 1000)
 
 # Add temp periods (For demography! )
@@ -1069,26 +1355,7 @@ df_long <- df %>% dplyr::rename(East = east_diff, West = west_diff) %>%
     cols = c(West, East),
     names_to = "region",
     values_to = "difference"
-  )
-
-breeding <- ggplot(df_long, aes(x = year_ka, y = difference, group = region)) +  
-  geom_link2(aes(colour = after_stat(ifelse(y > 0, "Overlap", "Gap"))),
-             linewidth = 0.5) +
-  scale_x_reverse(limits=c(800,0),
-    breaks = seq(0, 800, by = 100),  
-    labels = function(x) paste0(x, " Ka")) +
-  geom_hline(yintercept = 0, lty = 2) +
-  geom_rect(data=periods,aes(xmin=xmin,xmax=xend,ymin=-Inf,ymax=Inf,fill=col),inherit.aes=FALSE,alpha=0.25)+
-  scale_fill_manual(values=c('cyan3','salmon2'))+
-  scale_color_manual(values=c('darkorchid','seagreen','darkblue','yellow'))+
-  labs(y = "Overlap (+) or Gap (-)", x = "Year") +
-  scale_y_continuous(limits = c(-40, 40)) +
-  #facet_grid(region ~ ., scales = "free") + #for separated east/west
-  theme_bw(base_size = 8)+
-  theme(legend.position='none')
-breeding
-
-df_long <- df_long %>%
+  ) %>% 
   mutate(color = case_when(
     region == "East" & difference >= 0 ~ "A",
     region == "West" & difference >= 0 ~ "B",
@@ -1115,14 +1382,84 @@ breeding
 ggsave('20250206_BreedingOverlap.png',breeding,height=0.95,width=6.5,dpi=600,units='in')
 ggsave('20250206_BreedingOverlapAxes.pdf',breeding,height=0.95,width=6.5,dpi=600,units='in')
 
+## Correlation
+
+# set extreme outliers to 99% quantile
+df_long <- df_long %>% group_by(region) %>% mutate(thresh_low = quantile(difference, 0.05, na.rm = TRUE),
+                                        thresh_hi = quantile(difference, 0.95, na.rm = TRUE),
+                                        year_ka = year/1000)
+overlaps <- df_long %>% filter(difference > thresh_hi) %>% mutate(class = 'Overlap', id = paste0(class,'_',region))
+gaps <- df_long %>% filter(difference < thresh_low) %>% mutate(class = 'Gap', id = paste0(class,'_',region))
+top <- rbind(overlaps,gaps)
+  
+# plot against temperature
+temp_diffs <- ggplot(df, aes(x = year_ka, y = Temp, color = Temp)) +
+  geom_line() +
+  scale_color_gradientn(colors = c("blue", "red")) +
+  geom_rect(data=top,aes(xmin=year_ka-1,xmax=year_ka+1,ymin=-Inf,ymax=Inf,fill=id),inherit.aes=FALSE,alpha=0.5)+
+  scale_x_reverse(limits=c(800,0),
+                  breaks = seq(0, 800, by = 100),  
+                  labels = function(x) paste0(x, " Ka")) +
+  labs(y = "Temperature", x = "Year") +
+  facet_grid(1~.,scales='free')+
+  theme_bw(base_size=8) +
+  theme(legend.position='top')
+temp_diffs
+ggsave('20251013_GapsOverlaps_Temp.pdf',temp_diffs,height=0.95,width=6.5,dpi=600,units='in')
+
+
+df_thresh <- df_long %>% group_by(region) %>% mutate(difference = pmax(difference, quantile(difference, 0.025, na.rm = TRUE)))
+df_thresh %>% group_by(region) %>% slice_min(difference) %>% data.frame
+
+df_east <- df_thresh %>% filter(region == "East")
+df_west <- df_thresh %>% filter(region == "West")
+
+p_east <- ggplot(df_east, aes(x = Temp, y = difference, color = difference)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+           method = "pearson", label.x.npc = "left", label.y.npc = "bottom",
+           size = 4, color = "black", show.legend = FALSE) +
+  scale_color_gradientn(colors = c("darkgreen", "darkblue")) +
+  theme_classic(base_size = 14) +
+  labs(title = "East", x = "Temperature (°C)", y = "Difference") +
+  theme(legend.position = "right")
+
+p_west <- ggplot(df_west, aes(x = Temp, y = difference, color = difference)) +
+  geom_point(size = 2) +
+  geom_smooth(method = "lm", se = FALSE, color = "black") +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+           method = "pearson", label.x.npc = "left", label.y.npc = "bottom",
+           size = 4, color = "black", show.legend = FALSE) +
+  scale_color_gradientn(colors = c("lightgreen", "blue")) +
+  theme_classic(base_size = 14) +
+  labs(title = "West", x = "Temperature (°C)", y = "Difference") +
+  theme(legend.position = "right")
+
+combined <- ggarrange(p_west, p_east, ncol = 2, common.legend = FALSE)
+combined
+
+
+ggplot(df_long, aes(x = Temp, y = difference, color = difference)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+           method = "pearson", label.x.npc = "left", label.y.npc = "bottom",
+           size = 4, show.legend = FALSE) +
+  scale_color_continuous(low='lightgreen',high='blue')+
+  facet_wrap(~ region, scales = "free") +
+  theme_classic() +
+  labs(x = "Temperature (°C)", y = "Difference", title = "Correlation by Region")
+
 
 # Gaps
 df_tracks <- df %>% 
-  pivot_longer(c(EWgap, Sahara0Gap,IndianOcean)) 
-df_tracks$name <- factor(df_tracks$name,levels=c('EWgap','Sahara0Gap','IndianOcean'))  
+  pivot_longer(c(Gap_EastWest, Gap_Sahara, Gap_IndianOcean)) %>% 
+  mutate(name = gsub('Gap_','',name))
+df_tracks$name <- factor(df_tracks$name,levels=c('EastWest','Sahara','IndianOcean'))  
 tracks <- df_tracks %>% 
   ggplot(aes(x = year_ka, y = value,col=name)) +
-  geom_line(linewidth = 0.75) +
+  geom_line(linewidth = 0.3) +
   geom_hline(yintercept=0.5,lty=2,col='grey30')+
   scale_x_reverse(limits=c(800,0),
                   breaks = seq(0, 800, by = 100),  
@@ -1132,12 +1469,11 @@ tracks <- df_tracks %>%
   labs(y = "Temperature", x = "Year")+
   scale_color_manual(values=brewer.pal(3,'Set2'))+
   #facet_grid(name~.,scales='free')+
-  theme_bw(base_size=8) +
-  coord_cartesian(ylim=c(0,1))
-  theme(legend.position='none')
-tracks
+  theme_bw(base_size=8)+
+  theme(legend.position = 'none')
+tracks  
 
-ggsave('20250206_Gaps.pdf',tracks,height=0.95,width=6.5,dpi=600,units='in')
+ggsave('20251103_Gaps.pdf',tracks,height=0.95,width=6.5,dpi=600,units='in')
 
 
 ```
@@ -1867,6 +2203,528 @@ admixture -j7 --cv=5 ../../autosomal_files/${GROUP}.MQ-5X-MM1-AA-LDr2w50.bed ${K
 
 ## Ancestral Reconstruction
 
+### Sorenson 2005
+
+Tree exists [here](https://pmc.ncbi.nlm.nih.gov/articles/PMC2211511/#sec10)
+
+```R
+#### Plot & estimate species tree 
+setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/sorenson/')
+.libPaths('~/r_libs/')
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(treeio)
+library(phytools)
+
+txt <- readLines("Sorenson_Tree.txt")
+
+# extract translation table and tree string
+translate_block <- txt[str_detect(txt, "Translate"):length(txt)]
+translate_block <- translate_block[!str_detect(translate_block, "tree PAUP")]
+translate_block <- translate_block[!str_detect(translate_block, "End")]
+translate_block <- str_subset(translate_block, "\\d+\\s")
+
+# make translation dataframe
+trans <- str_match(translate_block, "\\s*(\\d+)\\s+([^,;]+)")[,2:3] |> as.data.frame()
+names(trans) <- c("id","label")
+
+# extract tree line(s)
+tree_line <- str_subset(txt, "^tree PAUP")
+tree_str  <- str_extract(tree_line, "\\(.*\\);")
+
+# replace IDs with labels
+for(i in seq_len(nrow(trans))){
+  tree_str <- str_replace_all(tree_str,
+                              paste0("\\b", trans$id[i], "\\b"),
+                              trans$label[i])
+}
+
+
+# write clean Newick
+writeLines(tree_str, "Payne_Sorenson_tree.newick")
+
+# test read
+t <- read.tree(text = tree_str)
+t <- read.tree('Payne_Sorenson_tree.newick')
+t
+m1 = treeio::root(as.phylo(t),outgroup='A353_Geococcyx_californianus',resolve.root=TRUE)
+ggtree(m1)+
+  geom_nodelab(aes(label=node),geom = 'label',size=3)
+
+# Okay now read back in metadata after extracting details
+md <- read_tsv('Metadata.txt')
+
+# remove duplicates and the 2 species which cluster inter-genically
+subtree_nodup <- keep.tip(m1, md$TreeID)
+ggtree(subtree_nodup)+geom_tiplab()
+m3 <- treeio::root(as.phylo(subtree_nodup),outgroup=c('A353_Geococcyx_californianus','DAB1518_Geococcyx_velox'),resolve.root=TRUE)
+treemd <- md %>% dplyr::rename(label = TreeID) %>% select(-ID)
+g1 <- ggtree(m3,layout = 'rectangular') %<+% treemd
+g1+geom_tiplab(aes(label=Genus),align = TRUE,size=2)
+write.tree(m3,file='N142_Sorenson.nwk')
+
+```
+
+And infer states:
+
+#### Route
+
+```R
+#### Plot & estimate species tree 
+setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/sorenson/')
+.libPaths('~/r_libs/')
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(treeio)
+library(phytools)
+library(RColorBrewer)
+library(ggimage)
+library(meRo)
+library(glue)
+
+### read in data 
+m = read.tree('N87_Sorenson.nwk')
+m1 = treeio::root(as.phylo(m),outgroup=c('PB14_Ceuthmochares_a_aereus','A1068_Ceuthmochares_a_australis'),resolve.root=TRUE)
+
+phenos <- read_tsv('Metadata.txt') %>% mutate(TreeID = as.character(TreeID), ID = as.character(ID))
+phenotypes <- setNames(phenos$Sroute, phenos$ID)
+
+# Set species to tip name 
+lookup <- setNames(phenos$ID, phenos$TreeID)
+m1$tip.label <- lookup[m1$tip.label]
+
+set.seed(123)
+
+#Plot probabilities 
+t2 <- multi2di(m1)
+fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+sims <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+sim_list <- as.list(sims)
+
+##### Plot #####
+## cols parameter indicate which columns store stats
+# summarize simmap object
+obj <- describe.simmap(sims, plot = FALSE)
+
+# extract node posterior probabilities
+mcmc_nodes <- obj$ace %>%
+  as.data.frame() %>%
+  rownames_to_column("node") %>%
+  filter(!grepl('_',node)) %>% 
+  mutate(node = gsub('X','',node)) %>% 
+  mutate(across(-node, as.numeric),
+         node = as.integer(node))
+
+okabe_ito_9 <- c(
+  "#E69F00", # orange
+  "#56B4E9", # sky blue
+  "#009E73", # bluish green
+  "#F0E442", # yellow
+  "#0072B2", # blue
+  "#D55E00", # vermillion
+  "#CC79A7", # reddish purple
+  "gray",
+  "white"
+)
+
+# define the colors (same order as describe.simmap states)
+cols <- setNames(c(okabe_ito_9[2:7]),
+                 c("AA","AP","II","NS","S","SS"))
+shps <- setNames(c(21,23,24,21,23,24),
+                 c("AA","AP","II","NS","S","SS"))
+
+# build base tree plot
+nodepie_clean <- function(data, idx_cols, fill_map, color = NA, alpha = 1) {
+  pies <- vector("list", nrow(data))
+  for (i in seq_len(nrow(data))) {
+    df <- data.frame(state = names(data)[idx_cols],
+                     value = as.numeric(data[i, idx_cols]))
+    pies[[i]] <- ggplot(df, aes(x = "", y = value, fill = state)) +
+      geom_bar(stat = "identity", width = 1, color = color, alpha = alpha) +
+      coord_polar(theta = "y") +
+      theme_void() +
+      theme(legend.position = "none") +
+      scale_fill_manual(values = fill_map)
+  }
+  names(pies) <- data$node
+  pies
+}
+
+# base tree with metadata
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+
+# pies using explicit arg names
+pies <- nodepie_clean(mcmc_nodes, idx_cols = 2:ncol(mcmc_nodes), fill_map = cols)
+
+# overlay pies and add filled tip points
+p2 <- p +
+  #geom_inset(pies, width = 0.035, height = 0.035) +
+  geom_tippoint(aes(fill = Sroute, shape = Sroute), size = 2, color = "black") + 
+  #geom_tiplab(aes(label=Genus),size=1,offset = 0.02,align = TRUE)+
+  scale_fill_manual(values = cols, name = "Route")+
+  scale_shape_manual(values = shps, name = "Route")+
+  theme(legend.position='none')
+p2
+
+# export to PDF
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_TIPS.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_NODES.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_LABS.pdf',height=6,width=4.5,p2)
+
+
+##### Plot Transitions #####
+# precompute genus and tip IDs
+
+n_iter <- 10    
+full_res <- list()
+
+for (i in seq_len(n_iter)) {
+  rand_seed <- sample(1:1000, 1)  
+  set.seed(rand_seed)
+  cat('Working on replicate: ',i,'\n')
+
+  #Plot probabilities 
+  t2 <- multi2di(m1)
+  fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+  sims_rep <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+  sim_list <- as.list(sims)
+  obj_rep <- describe.simmap(sims_rep, plot = FALSE)
+  
+  genus_tips <- split(phenos$ID, phenos$Genus)
+  
+  # target genera
+  targs <- phenos %>% count(Genus) %>% filter(n > 1) %>% filter(!grepl('Ceuth',Genus))
+  
+  # state names from any simmap
+  states <- colnames(sim_list[[1]]$mapped.edge)
+  
+  # storage list
+  out_list <- list()
+  
+  # main loop
+  for (g in targs$Genus) {
+    tips <- genus_tips[[g]]
+    
+    # skip genera with <2 taxa
+    if (length(tips) < 2) next
+    
+    # the node is hte same across all trees 
+    tr <- sim_list[[1]]
+    node <- try(getMRCA(tr, tips), silent = TRUE)
+    if (inherits(node, "try-error") || is.null(node)) next
+    
+    # extract mapped edge table for the subtree leading from that node
+    edge_states <- obj_rep$ace[as.character(node),]
+    if (length(edge_states) == 0) next
+    
+    # compute total length per state in that node’s branch(s)
+    bl <- unlist(edge_states)
+    bl_tbl <- tapply(bl, names(bl), sum)
+    
+    # normalize
+    prop <- bl_tbl / sum(bl_tbl)
+    prop <- prop[states]  # keep consistent order
+    prop[is.na(prop)] <- 0
+    names(prop) <- states
+    
+    # store
+    out_list[[length(out_list) + 1]] <- tibble(
+      Genus = g,
+      Node = node,
+      State = names(prop),
+      Proportion = as.numeric(prop)
+    )
+  }
+  
+  # bind all results
+  res <- bind_rows(out_list)
+  res$Replicate <- i
+  full_res[[i]] <- res
+
+}
+
+full_all <- bind_rows(full_res)
+write.table(full_all,file='Bootstrapped_States_Route_20251014.txt',quote=F,sep='\t',row.names=F)https://ood-2.ai.lrz.de/rnode/cpu-011.ai.lrz.de/8912/graphics/27ea9a7a-69a9-4a60-8ab7-71b7e2d4f59d.png
+
+# highlight nodes, first extract order of smples
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+tree_df <- p$data
+
+# subset only tips (not internal nodes)
+tip_df <- tree_df %>%
+  dplyr::filter(isTip) %>%
+  dplyr::select(label, Genus, Species)
+genus_df <- tip_df %>% distinct(Genus) %>% mutate(order = row_number())
+
+nodelab <- full_all %>% distinct(Genus,Node) %>% left_join(.,genus_df) %>% arrange(order) %>% mutate(label_letter = letters[seq_len(n())])
+labs <- p +
+  geom_nodelab(
+  data = p$data %>% 
+    dplyr::inner_join(nodelab, by = c("node" = "Node")),
+  aes(label = label_letter),
+  nudge_x = -0.005,
+  nudge_y = 0.9,
+  size = 4,
+  color = "red"
+)
+labs
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_TreeLabels.pdf',height=6,width=4.5,labs)
+
+# Plot likelihoods
+res_sum <- full_all %>% group_by(Genus,State) %>% sum_stats(Proportion)
+res_sum$Genus <- factor(res_sum$Genus,levels=rev(genus_df$Genus))
+state_plot <- res_sum %>% ggplot(aes(y=Genus,x=mean,fill=State,shape=State,xmin=conf_low,xmax=conf_high))+
+  geom_errorbar(width=0.25)+
+  geom_point(size=2.5)+
+  scale_fill_manual(values=cols)+
+  scale_shape_manual(values=c(21,23,24,21,23,24))+
+  theme_bw()+
+  theme(legend.position='top')
+state_plot
+
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_Targets.pdf',height=4.5,width=2.5,state_plot)
+
+# Save summary text
+save_df <- res_sum %>%
+  mutate(
+    label = glue("{round(mean, 2)} ({round(conf_low, 2)}-{round(conf_high, 2)})")
+  ) %>%
+  select(Genus, State, label) %>%
+  pivot_wider(
+    names_from = State,
+    values_from = label
+  )
+save_df
+write.csv(save_df,file='20251015_Sroute_Summary.csv')
+
+```
+
+#### Overwintering
+
+```
+#### Plot & estimate species tree 
+setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/sorenson/')
+.libPaths('~/r_libs/')
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(treeio)
+library(phytools)
+library(RColorBrewer)
+library(ggimage)
+library(meRo)
+library(glue)
+
+### read in data 
+m = read.tree('N87_Sorenson.nwk')
+m1 = treeio::root(as.phylo(m),outgroup=c('PB14_Ceuthmochares_a_aereus','A1068_Ceuthmochares_a_australis'),resolve.root=TRUE)
+
+phenos <- read_tsv('Metadata.txt') %>% mutate(TreeID = as.character(TreeID), ID = as.character(ID))
+phenotypes <- setNames(phenos$Nonbreeding, phenos$ID)
+table(phenos$Nonbreeding)
+
+# Set species to tip name 
+lookup <- setNames(phenos$ID, phenos$TreeID)
+m1$tip.label <- lookup[m1$tip.label]
+
+set.seed(123)
+
+#Plot probabilities 
+t2 <- multi2di(m1)
+fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+sims <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+sim_list <- as.list(sims)
+
+##### Plot #####
+## cols parameter indicate which columns store stats
+# summarize simmap object
+obj <- describe.simmap(sims, plot = FALSE)
+
+# extract node posterior probabilities
+mcmc_nodes <- obj$ace %>%
+  as.data.frame() %>%
+  rownames_to_column("node") %>%
+  filter(!grepl('_',node)) %>% 
+  mutate(node = gsub('X','',node)) %>% 
+  mutate(across(-node, as.numeric),
+         node = as.integer(node))
+
+
+# define the colors (same order as describe.simmap states)
+cols <- setNames(c("#CC79A7","#56B4E9","#F0E442"),
+                 c("AM","A","I"))
+
+# build base tree plot
+nodepie_clean <- function(data, idx_cols, fill_map, color = NA, alpha = 1) {
+  pies <- vector("list", nrow(data))
+  for (i in seq_len(nrow(data))) {
+    df <- data.frame(state = names(data)[idx_cols],
+                     value = as.numeric(data[i, idx_cols]))
+    pies[[i]] <- ggplot(df, aes(x = "", y = value, fill = state)) +
+      geom_bar(stat = "identity", width = 1, color = color, alpha = alpha) +
+      coord_polar(theta = "y") +
+      theme_void() +
+      theme(legend.position = "none") +
+      scale_fill_manual(values = fill_map)
+  }
+  names(pies) <- data$node
+  pies
+}
+
+# base tree with metadata
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+
+# pies using explicit arg names
+pies <- nodepie_clean(mcmc_nodes, idx_cols = 2:ncol(mcmc_nodes), fill_map = cols)
+
+# overlay pies and add filled tip points
+p2 <- p +
+  #geom_inset(pies, width = 0.035, height = 0.035) +
+  geom_tippoint(aes(fill = Nonbreeding),pch=22, size = 2, color = "black") + 
+  #geom_tiplab(aes(label=Genus),size=1,offset = 0.02,align = TRUE)+
+  scale_fill_manual(values = cols, name = "Overwintering")+
+  theme(legend.position='none')
+p2
+
+# export to PDF
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_TIPS.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_NODES.pdf',height=6,width=4.5,p2)
+
+
+##### Plot Transitions #####
+# precompute genus and tip IDs
+
+n_iter <- 10    
+full_res <- list()
+
+for (i in seq_len(n_iter)) {
+  rand_seed <- sample(1:1000, 1)  
+  set.seed(rand_seed)
+  cat('Working on replicate: ',i,'\n')
+
+  #Plot probabilities 
+  t2 <- multi2di(m1)
+  fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+  sims_rep <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+  sim_list <- as.list(sims)
+  obj_rep <- describe.simmap(sims_rep, plot = FALSE)
+  
+  genus_tips <- split(phenos$ID, phenos$Genus)
+  
+  # target genera
+  targs <- phenos %>% count(Genus) %>% filter(n > 1) %>% filter(!grepl('Ceuth',Genus))
+  
+  # state names from any simmap
+  states <- colnames(sim_list[[1]]$mapped.edge)
+  
+  # storage list
+  out_list <- list()
+  
+  # main loop
+  for (g in targs$Genus) {
+    tips <- genus_tips[[g]]
+    
+    # skip genera with <2 taxa
+    if (length(tips) < 2) next
+    
+    # the node is hte same across all trees 
+    tr <- sim_list[[1]]
+    node <- try(getMRCA(tr, tips), silent = TRUE)
+    if (inherits(node, "try-error") || is.null(node)) next
+    
+    # extract mapped edge table for the subtree leading from that node
+    edge_states <- obj_rep$ace[as.character(node),]
+    if (length(edge_states) == 0) next
+    
+    # compute total length per state in that node’s branch(s)
+    bl <- unlist(edge_states)
+    bl_tbl <- tapply(bl, names(bl), sum)
+    
+    # normalize
+    prop <- bl_tbl / sum(bl_tbl)
+    prop <- prop[states]  # keep consistent order
+    prop[is.na(prop)] <- 0
+    names(prop) <- states
+    
+    # store
+    out_list[[length(out_list) + 1]] <- tibble(
+      Genus = g,
+      Node = node,
+      State = names(prop),
+      Proportion = as.numeric(prop)
+    )
+  }
+  
+  # bind all results
+  res <- bind_rows(out_list)
+  res$Replicate <- i
+  full_res[[i]] <- res
+
+}
+
+full_all <- bind_rows(full_res)
+write.table(full_all,file='Bootstrapped_States_NonBreeding_20251014.txt',quote=F,sep='\t',row.names=F)
+
+# highlight nodes, first extract order of smples
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+tree_df <- p$data
+
+# subset only tips (not internal nodes)
+tip_df <- tree_df %>%
+  dplyr::filter(isTip) %>%
+  dplyr::select(label, Genus, Species)
+genus_df <- tip_df %>% distinct(Genus) %>% mutate(order = row_number())
+
+nodelab <- full_all %>% distinct(Genus,Node) %>% left_join(.,genus_df) %>% arrange(order) %>% mutate(label_letter = letters[seq_len(n())])
+labs <- p +
+  geom_nodelab(
+  data = p$data %>% 
+    dplyr::inner_join(nodelab, by = c("node" = "Node")),
+  aes(label = label_letter),
+  nudge_x = -0.005,
+  nudge_y = 0.9,
+  size = 4,
+  color = "red"
+)
+labs
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_TreeLabels.pdf',height=6,width=4.5,labs)
+
+# Plot likelihoods
+res_sum <- full_all %>% group_by(Genus,State) %>% sum_stats(Proportion)
+res_sum$Genus <- factor(res_sum$Genus,levels=rev(genus_df$Genus))
+state_plot <- res_sum %>% ggplot(aes(y=Genus,x=mean,fill=State,xmin=conf_low,xmax=conf_high))+
+  geom_errorbar(width=0.25)+
+  geom_point(size=2.5,pch=22)+
+  scale_fill_manual(values=cols)+
+  theme_bw()+
+  theme(legend.position='top')
+state_plot
+
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_Targets.pdf',height=4.5,width=2.5,state_plot)
+
+# Save summary text
+save_df <- res_sum %>%
+  mutate(
+    label = glue("{round(mean, 2)} ({round(conf_low, 2)}-{round(conf_high, 2)})")
+  ) %>%
+  select(Genus, State, label) %>%
+  pivot_wider(
+    names_from = State,
+    values_from = label
+  )
+save_df
+write.csv(save_df,file='20251015_NonBreeding_Summary.csv')
+
+```
+
+
+
+
+
+
+
 Grab 5K gene trees with 6670 OTUs using the 'Sequenced Species' dataset of Hackett from [BirdTree](https://birdtree.org/subsets/)
 
 Includes 126 of the Cuculiformes species:
@@ -1874,6 +2732,13 @@ Includes 126 of the Cuculiformes species:
 ```bash
 Stage 2 MayrParSho Hackett: 10K trees with 6670 OTUs [10k sampled]
 Job ID: tree-pruner-3972b4dc-d4e3-42db-8473-30777033c335
+```
+
+Or just n=55:
+
+```
+Hackett All Species: 10k trees with 9993 OTUs [5k sampled], n=55
+tree-pruner-1755d7cc-acc9-4cb2-a729-7e6bd9e2a5af
 ```
 
 Estimate species tree from the hackett trees:
@@ -1904,7 +2769,7 @@ Using that concordance tree, estimate ancestral state changes:
 ```bash
 #### Plot & estimate species tree 
 setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/')
-.libPaths('~/mambaforge/envs/R/lib/R/library')
+.libPaths('~/r_libs/')
 library(ggtree)
 library(ape)
 library(tidyverse)
@@ -1913,7 +2778,6 @@ library(viridis)
 library(ggpubr)
 library(RColorBrewer)
 library(phytools)
-.libPaths('~/mambaforge/envs/r/lib/R/library')
 library(magick)
 
 # # Only run this the first time to convert the nex trees
@@ -1926,6 +2790,11 @@ library(magick)
 # Read in iqtree
 iqtree <- read.iqtree('species.tre')
 iqtree_root <- treeio::root(as.phylo(iqtree),outgroup='Geococcyx_californianus',resolve.root=TRUE)
+
+# dumb fix for ggplot  / ggtree updates
+if (!exists("is.waive", mode = "function")) {
+  is.waive <- function(x) inherits(x, "waiver")
+}
 
 gg <- ggtree(iqtree_root, layout = "rectangular")
 gg
@@ -1941,6 +2810,9 @@ gg +
 
 # Generate base tree 
 md <- read.table('Species_Data.txt',header=TRUE)
+
+# Update tip name: e.g. Cuculus_fugax is now known as Hierococcyx fugax, which is indicated in genus + speices
+#md <- md %>% mutate(ID_renamed = paste0(Genus,'_',Species))
 targ_tree <- as.phylo(iqtree_root)
 ggt <- ggtree(targ_tree, layout = "rectangular",branch.length='none') %<+% md 
 
@@ -1952,6 +2824,10 @@ phenotypes <- setNames(as.vector(mat[, 1]), targ_tree$tip.label)
 #Plot probabilities 
 t2 <- multi2di(targ_tree)
 t2$edge.length[is.na(t2$edge.length)] <- 1e-8
+
+# ensure alignment
+setdiff(names(phenotypes), t2$tip.label)
+setdiff(t2$tip.label, names(phenotypes))
 
 # Quick ape method 
 fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
@@ -1966,7 +2842,8 @@ tip_rename <- left_join(data.frame(label=t2$tip.label),md) %>%
   mutate(lab = paste0(Genus,'_',Species))
 t2$tip.label <- tip_rename$lab
 
-#### Main plot, node labels < 100 bootstrap support 
+
+##### Main plot, node labels < 100 bootstrap support #####
 pdf('20250115_ReconstructionER-Cuculiformes_Residency-Node80.pdf',height=7,width=7)
 cols<-setNames(viridis(3)[1:length(unique(phenotypes))],sort(unique(phenotypes)))
 plotTree(t2,ftype="off")
@@ -2007,10 +2884,18 @@ add.simmap.legend(colors=cols,prompt=FALSE,x=0.5,
                   y=max(nodeHeights(t2)-50),fsize=2)
 dev.off()
 
-##### Migration route reconstruction ####
+##### Migration route reconstruction #####
 #grab only route
 mat2 <- as.matrix(phenos %>% select(Route))
 phenotypes2 <- setNames(as.vector(mat2[, 1]), targ_tree$tip.label)
+
+#Plot probabilities 
+t2 <- multi2di(targ_tree)
+t2$edge.length[is.na(t2$edge.length)] <- 1e-8
+
+# ensure alignment
+setdiff(names(phenotypes2), t2$tip.label)
+setdiff(t2$tip.label, names(phenotypes2))
 
 # Quick ape method 
 fitER2 <- ape::ace(phenotypes2,t2,model="ER",type="discrete")
@@ -2082,15 +2967,797 @@ tp_phenos
 
 ggsave('20250115_Cuculiformes-Residency-ggtree.pdf',tp_phenos,height=15,width=15,dpi=300)
 
+
+##### Summarize ######
+# by genus, ensure proper alignment with updated genera
+
+md <- read.table('Species_Data.txt',header=TRUE)
+md <- md %>% mutate(new_label = paste0(Genus,'_',Species))
+
+# Update tip name: e.g. Cuculus_fugax is now known as Hierococcyx fugax, which is indicated in genus + speices
+#md <- md %>% mutate(ID_renamed = paste0(Genus,'_',Species))
+targ_tree <- as.phylo(iqtree_root)
+ggt <- ggtree(targ_tree, layout = "rectangular",branch.length='none') %<+% md 
+
+#grab only residency
+phenos <- as.data.frame(ggt$data %>% filter(isTip == TRUE))
+#grab only route
+mat2 <- as.matrix(phenos %>% select(Route))
+phenotypes2 <- setNames(as.vector(mat2[, 1]), targ_tree$tip.label)
+
+# updated phenos
+phenos_route <- md %>% select(Route)
+phenos_route <- setNames(as.vector(phenos_route[,1]),md$new_label)
+
+#Plot probabilities 
+t2 <- multi2di(targ_tree)
+t2$edge.length[is.na(t2$edge.length)] <- 1e-8
+
+t2$node.label <- gsub('.*\\/','',t2$node.label)
+tip_rename <- left_join(data.frame(label=t2$tip.label),md) %>% 
+  mutate(lab = paste0(Genus,'_',Species))
+t2$tip.label <- tip_rename$lab
+
+
+
+tip_df <- tibble(label = t2$tip.label) |>
+  separate(label, into = c("Genus","Species"), sep = "_", remove = FALSE)
+
+genus_tips <- tip_df |>
+  group_by(Genus) |>
+  summarize(tips = list(label), n = n(), .groups="drop") |>
+  filter(n >= 2)            # need at least 2 tips to have internal edges
+
+states <- sort(unique(phenos_route))
+# ensure the state factor order is consistent everywhere
+phenos_route <- factor(phenos_route, levels = states)
+
+setdiff(names(phenos_route), t2$tip.label)
+setdiff(t2$tip.label, names(phenos_route))
+
+## Stochastic character mapping across whole tree under ER
+set.seed(123)
+nsim <- 200  # bump if you want tighter intervals
+# let phytools estimate Q, use ER, and estimate root pi
+sims <- make.simmap(t2, phenos_route, model = "ER", pi = "estimated", nsim = nsim, message = FALSE)
+
+## helper: count transitions within a genus for one simmap
+count_transitions_genus <- function(simmap, tips, all_states) {
+  if (length(tips) < 2) {
+    M <- matrix(0, length(all_states), length(all_states),
+                dimnames = list(all_states, all_states))
+    return(M)
+  }
+  sub_tr <- keep.tip(simmap, tips)
+  d <- phytools::describe.simmap(sub_tr)$N  # from x to y counts
+  # coerce to full state-by-state matrix
+  M <- matrix(0, length(all_states), length(all_states),
+              dimnames = list(all_states, all_states))
+  rn <- intersect(rownames(d), all_states)
+  cn <- intersect(colnames(d), all_states)
+  if (length(rn) && length(cn)) M[rn, cn] <- d[rn, cn]
+  diag(M) <- 0
+  M
+}
+
+## Accumulate counts across simulations
+sim_df <- map_dfr(seq_along(sims), function(i) {
+  simmap <- sims[[i]]
+  map_dfr(seq_len(nrow(genus_tips)), function(gi) {
+    gname <- genus_tips$Genus[gi]
+    tips  <- genus_tips$tips[[gi]]
+    M <- count_transitions_genus(simmap, tips, states)
+    as_tibble(as.table(M), .name_repair = "minimal") |>
+      rename(from = Var1, to = Var2, count = n) |>
+      mutate(genus = gname, sim = i)
+  })
+})
+
+## Summaries per genus and transition
+summ <- sim_df |>
+  group_by(genus, from, to) |>
+  summarize(mean_count = mean(count),
+            sd_count   = sd(count),
+            median_count = median(count),
+            q025 = quantile(count, 0.025),
+            q975 = quantile(count, 0.975),
+            .groups = "drop")
+
+## Add per-genus totals and proportions
+genus_totals <- summ |>
+  group_by(genus) |>
+  summarize(total_mean_transitions = sum(mean_count), .groups="drop")
+
+results <- summ |>
+  left_join(genus_totals, by = "genus") |>
+  mutate(prop_of_genus = ifelse(total_mean_transitions > 0,
+                                mean_count / total_mean_transitions, NA_real_)) |>
+  arrange(genus, from, to)
+
+## Nice compact table: only off-diagonals and only your four focal states
+focal_states <- c("II","AA","APe","APw")
+results_focal <- results |>
+  filter(from %in% focal_states, to %in% focal_states, from != to)
+
+# View a few examples
+results_focal %>% arrange(desc(mean_count)) %>% print(n = 40)
+
+# Optional: heatmap per genus (mean counts)
+# library(ggplot2)
+# ggplot(results_focal, aes(from, to, fill = mean_count)) +
+#   geom_tile() + facet_wrap(~ genus, scales = "free") +
+#   geom_text(aes(label = round(mean_count, 1))) +
+#   scale_fill_viridis_c() + theme_bw() +
+#   labs(title = "Within-genus route transitions (mean across SIMMAPs)",
+#        x = "From", y = "To", fill = "Mean\ncount")
+
+## Deterministic fallback (no SIMMAP, single ML argmax):
+ml_node_states <- apply(fitER2$lik.anc, 1, function(p) names(which.max(p)))
+# Build a named vector of states for ALL nodes (tips + internal)
+node_ids <- 1:(Ntip(t2) + t2$Nnode)
+tip_ids  <- 1:Ntip(t2)
+int_ids  <- (Ntip(t2)+1):(Ntip(t2)+t2$Nnode)
+
+state_by_node <- character(length(node_ids))
+names(state_by_node) <- node_ids
+# tip states by order of t2$tip.label
+state_by_node[tip_ids] <- as.character(phenotypes2[t2$tip.label])
+# internal node states in the order ape uses
+state_by_node[int_ids] <- ml_node_states[as.character(int_ids)]
+
+edges <- as_tibble(t2$edge, .name_repair="minimal") |>
+  rename(parent = V1, child = V2) |>
+  mutate(from = state_by_node[as.character(parent)],
+         to   = state_by_node[as.character(child)],
+         change = from != to)
+
+# For each genus, restrict to the clade and count parent->child changes inside it
+ml_counts <- map_dfr(genus_tips$Genus, function(gname){
+  tips <- genus_tips$tips[[match(gname, genus_tips$Genus)]]
+  sub_nodes <- keep.tip(t2, tips)
+  keep_edge_hash <- paste(sub_nodes$edge[,1], sub_nodes$edge[,2], sep = "_")
+  edge_hash <- paste(edges$parent, edges$child, sep = "_")
+  sub_edges <- edges[edge_hash %in% keep_edge_hash,]
+  sub_edges |>
+    filter(change, from %in% focal_states, to %in% focal_states) |>
+    count(from, to, name="ml_count") |>
+    mutate(genus = gname, .before = 1)
+})
+
+ml_counts %>% arrange(genus, desc(ml_count)) %>% print(n = 40)
+```
+
+#### On Full N142
+
+```
+#### Plot & estimate species tree 
+setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/sorenson/')
+.libPaths('~/r_libs/')
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(treeio)
+library(phytools)
+library(RColorBrewer)
+library(ggimage)
+library(meRo)
+library(glue)
+
+### read in data 
+m = read.tree('N142_Sorenson.nwk')
+m1 = treeio::root(as.phylo(m),outgroup=c('A353_Geococcyx_californianus','DAB1518_Geococcyx_velox'),resolve.root=TRUE)
+
+phenos <- read_tsv('Metadata.txt') %>% mutate(TreeID = as.character(TreeID), ID = as.character(ID))
+phenotypes <- setNames(phenos$Sroute, phenos$ID)
+
+# Set species to tip name 
+lookup <- setNames(phenos$ID, phenos$TreeID)
+m1$tip.label <- lookup[m1$tip.label]
+
+set.seed(123)
+
+#Plot probabilities 
+t2 <- multi2di(m1)
+fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+sims <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+sim_list <- as.list(sims)
+
+##### Plot #####
+## cols parameter indicate which columns store stats
+# summarize simmap object
+obj <- describe.simmap(sims, plot = FALSE)
+
+# extract node posterior probabilities
+mcmc_nodes <- obj$ace %>%
+  as.data.frame() %>%
+  rownames_to_column("node") %>%
+  filter(!grepl('_',node)) %>% 
+  mutate(node = gsub('X','',node)) %>% 
+  mutate(across(-node, as.numeric),
+         node = as.integer(node))
+
+okabe_ito_9 <- c(
+  "#E69F00", # orange
+  "#56B4E9", # sky blue
+  "#009E73", # bluish green
+  "#F0E442", # yellow
+  "#0072B2", # blue
+  "#D55E00", # vermillion
+  "#CC79A7", # reddish purple
+  "gray",
+  "white"
+)
+
+# define the colors (same order as describe.simmap states)
+cols <- setNames(c(okabe_ito_9[2:7]),
+                 c("AA","AP","II","NS","S","SS"))
+shps <- setNames(c(21,23,24,21,23,24),
+                 c("AA","AP","II","NS","S","SS"))
+
+# build base tree plot
+nodepie_clean <- function(data, idx_cols, fill_map, color = NA, alpha = 1) {
+  pies <- vector("list", nrow(data))
+  for (i in seq_len(nrow(data))) {
+    df <- data.frame(state = names(data)[idx_cols],
+                     value = as.numeric(data[i, idx_cols]))
+    pies[[i]] <- ggplot(df, aes(x = "", y = value, fill = state)) +
+      geom_bar(stat = "identity", width = 1, color = color, alpha = alpha) +
+      coord_polar(theta = "y") +
+      theme_void() +
+      theme(legend.position = "none") +
+      scale_fill_manual(values = fill_map)
+  }
+  names(pies) <- data$node
+  pies
+}
+
+# base tree with metadata
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+
+# pies using explicit arg names
+pies <- nodepie_clean(mcmc_nodes, idx_cols = 2:ncol(mcmc_nodes), fill_map = cols)
+
+# overlay pies and add filled tip points
+p2 <- p +
+  #geom_inset(pies, width = 0.035, height = 0.035) +
+  #geom_tippoint(aes(fill = Sroute, shape = Sroute), size = 2, color = "black") + 
+  geom_tiplab(size=0.75,offset = 0.02,align = TRUE)+
+  scale_fill_manual(values = cols, name = "Route")+
+  scale_shape_manual(values = shps, name = "Route")+
+  theme(legend.position='none')
+p2
+
+# export to PDF
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_TIPS_N142.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_NODES_N142.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_LABS_N142.pdf',height=6,width=4.5,p2)
+
+
+##### Plot Transitions #####
+# precompute genus and tip IDs
+
+n_iter <- 10    
+full_res <- list()
+
+for (i in seq_len(n_iter)) {
+  rand_seed <- sample(1:1000, 1)  
+  set.seed(rand_seed)
+  cat('Working on replicate: ',i,'\n')
+  
+  #Plot probabilities 
+  t2 <- multi2di(m1)
+  fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+  sims_rep <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+  sim_list <- as.list(sims)
+  obj_rep <- describe.simmap(sims_rep, plot = FALSE)
+  
+  genus_tips <- split(phenos$ID, phenos$Genus)
+  
+  # target genera
+  targs <- phenos %>% count(Genus) %>% filter(n > 1) %>% filter(!grepl('Ceuth',Genus))
+  
+  # state names from any simmap
+  states <- colnames(sim_list[[1]]$mapped.edge)
+  
+  # storage list
+  out_list <- list()
+  
+  # main loop
+  for (g in targs$Genus) {
+    tips <- genus_tips[[g]]
+    
+    # skip genera with <2 taxa
+    if (length(tips) < 2) next
+    
+    # the node is hte same across all trees 
+    tr <- sim_list[[1]]
+    node <- try(getMRCA(tr, tips), silent = TRUE)
+    if (inherits(node, "try-error") || is.null(node)) next
+    
+    # extract mapped edge table for the subtree leading from that node
+    edge_states <- obj_rep$ace[as.character(node),]
+    if (length(edge_states) == 0) next
+    
+    # compute total length per state in that node’s branch(s)
+    bl <- unlist(edge_states)
+    bl_tbl <- tapply(bl, names(bl), sum)
+    
+    # normalize
+    prop <- bl_tbl / sum(bl_tbl)
+    prop <- prop[states]  # keep consistent order
+    prop[is.na(prop)] <- 0
+    names(prop) <- states
+    
+    # store
+    out_list[[length(out_list) + 1]] <- tibble(
+      Genus = g,
+      Node = node,
+      State = names(prop),
+      Proportion = as.numeric(prop)
+    )
+  }
+  
+  # bind all results
+  res <- bind_rows(out_list)
+  res$Replicate <- i
+  full_res[[i]] <- res
+  
+}
+
+full_all <- bind_rows(full_res)
+write.table(full_all,file='Bootstrapped_States_Route_N142_20251014.txt',quote=F,sep='\t',row.names=F)
+
+# highlight nodes, first extract order of smples
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+tree_df <- p$data
+
+# subset only tips (not internal nodes)
+tip_df <- tree_df %>%
+  dplyr::filter(isTip) %>%
+  dplyr::select(label, Genus, Species)
+genus_df <- tip_df %>% distinct(Genus) %>% mutate(order = row_number())
+
+# Plot likelihoods
+res_sum <- full_all %>% group_by(Genus,State) %>% sum_stats(Proportion)
+res_sum$Genus <- factor(res_sum$Genus,levels=rev(genus_df$Genus))
+state_plot <- res_sum %>% ggplot(aes(y=Genus,x=mean,fill=State,shape=State,xmin=conf_low,xmax=conf_high))+
+  geom_errorbar(width=0.25)+
+  geom_point(size=2.5)+
+  scale_fill_manual(values=cols)+
+  scale_shape_manual(values=c(21,23,24,21,23,24))+
+  theme_bw()+
+  theme(legend.position='top')
+state_plot
+
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Sroute_Targets_N142.pdf',height=4.5,width=2.5,state_plot)
+
+# Save summary text
+save_df <- res_sum %>%
+  mutate(
+    label = glue("{round(mean, 2)} ({round(conf_low, 2)}-{round(conf_high, 2)})")
+  ) %>%
+  select(Genus, State, label) %>%
+  pivot_wider(
+    names_from = State,
+    values_from = label
+  )
+save_df
+write.csv(save_df,file='20251015_Sroute_Summary_N142.csv')
+
+##### Overwintering ######
+### read in data 
+m = read.tree('N142_Sorenson.nwk')
+m1 = treeio::root(as.phylo(m),outgroup=c('A353_Geococcyx_californianus','DAB1518_Geococcyx_velox'),resolve.root=TRUE)
+
+phenos <- read_tsv('Metadata.txt') %>% mutate(TreeID = as.character(TreeID), ID = as.character(ID))
+phenotypes <- setNames(phenos$Nonbreeding, phenos$ID)
+
+# Set species to tip name 
+lookup <- setNames(phenos$ID, phenos$TreeID)
+m1$tip.label <- lookup[m1$tip.label]
+
+set.seed(123)
+
+#Plot probabilities 
+t2 <- multi2di(m1)
+fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+sims <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+sim_list <- as.list(sims)
+
+##### Plot #####
+## cols parameter indicate which columns store stats
+# summarize simmap object
+obj <- describe.simmap(sims, plot = FALSE)
+
+# extract node posterior probabilities
+mcmc_nodes <- obj$ace %>%
+  as.data.frame() %>%
+  rownames_to_column("node") %>%
+  filter(!grepl('_',node)) %>% 
+  mutate(node = gsub('X','',node)) %>% 
+  mutate(across(-node, as.numeric),
+         node = as.integer(node))
+
+# define the colors (same order as describe.simmap states)
+cols <- setNames(c("#CC79A7","#56B4E9","#F0E442"),
+                 c("AM","A","I"))
+
+# build base tree plot
+nodepie_clean <- function(data, idx_cols, fill_map, color = NA, alpha = 1) {
+  pies <- vector("list", nrow(data))
+  for (i in seq_len(nrow(data))) {
+    df <- data.frame(state = names(data)[idx_cols],
+                     value = as.numeric(data[i, idx_cols]))
+    pies[[i]] <- ggplot(df, aes(x = "", y = value, fill = state)) +
+      geom_bar(stat = "identity", width = 1, color = color, alpha = alpha) +
+      coord_polar(theta = "y") +
+      theme_void() +
+      theme(legend.position = "none") +
+      scale_fill_manual(values = fill_map)
+  }
+  names(pies) <- data$node
+  pies
+}
+
+# base tree with metadata
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+
+# pies using explicit arg names
+pies <- nodepie_clean(mcmc_nodes, idx_cols = 2:ncol(mcmc_nodes), fill_map = cols)
+
+# overlay pies and add filled tip points
+p2 <- p +
+  geom_inset(pies, width = 0.035, height = 0.035) +
+  geom_tippoint(aes(fill = Nonbreeding),pch=22, size = 2, color = "black") + 
+  #geom_tiplab(size=0.2,offset = 0.02,align = TRUE)+
+  scale_fill_manual(values = cols, name = "Overwintering")+
+  theme(legend.position='none')
+p2
+
+# export to PDF
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_TIPS_N142.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_NODES_N142.pdf',height=6,width=4.5,p2)
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Nonbreeding_LABS_N142.pdf',height=6,width=4.5,p2)
+
+
+##### Plot Transitions #####
+# precompute genus and tip IDs
+
+n_iter <- 10    
+full_res <- list()
+
+for (i in seq_len(n_iter)) {
+  rand_seed <- sample(1:1000, 1)  
+  set.seed(rand_seed)
+  cat('Working on replicate: ',i,'\n')
+  
+  #Plot probabilities 
+  t2 <- multi2di(m1)
+  fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+  sims_rep <- make.simmap(t2, phenotypes, model="ER", pi="estimated",nsim=100)
+  sim_list <- as.list(sims)
+  obj_rep <- describe.simmap(sims_rep, plot = FALSE)
+  
+  genus_tips <- split(phenos$ID, phenos$Genus)
+  
+  # target genera
+  targs <- phenos %>% count(Genus) %>% filter(n > 1) %>% filter(!grepl('Ceuth',Genus))
+  
+  # state names from any simmap
+  states <- colnames(sim_list[[1]]$mapped.edge)
+  
+  # storage list
+  out_list <- list()
+  
+  # main loop
+  for (g in targs$Genus) {
+    tips <- genus_tips[[g]]
+    
+    # skip genera with <2 taxa
+    if (length(tips) < 2) next
+    
+    # the node is hte same across all trees 
+    tr <- sim_list[[1]]
+    node <- try(getMRCA(tr, tips), silent = TRUE)
+    if (inherits(node, "try-error") || is.null(node)) next
+    
+    # extract mapped edge table for the subtree leading from that node
+    edge_states <- obj_rep$ace[as.character(node),]
+    if (length(edge_states) == 0) next
+    
+    # compute total length per state in that node’s branch(s)
+    bl <- unlist(edge_states)
+    bl_tbl <- tapply(bl, names(bl), sum)
+    
+    # normalize
+    prop <- bl_tbl / sum(bl_tbl)
+    prop <- prop[states]  # keep consistent order
+    prop[is.na(prop)] <- 0
+    names(prop) <- states
+    
+    # store
+    out_list[[length(out_list) + 1]] <- tibble(
+      Genus = g,
+      Node = node,
+      State = names(prop),
+      Proportion = as.numeric(prop)
+    )
+  }
+  
+  # bind all results
+  res <- bind_rows(out_list)
+  res$Replicate <- i
+  full_res[[i]] <- res
+  
+}
+
+full_all <- bind_rows(full_res)
+write.table(full_all,file='Bootstrapped_States_Nonbreeding_N142_20251014.txt',quote=F,sep='\t',row.names=F)
+
+# highlight nodes, first extract order of smples
+p <- ggtree(sims[[1]], layout = "rectangular") %<+% phenos
+tree_df <- p$data
+
+# subset only tips (not internal nodes)
+tip_df <- tree_df %>%
+  dplyr::filter(isTip) %>%
+  dplyr::select(label, Genus, Species)
+genus_df <- tip_df %>% distinct(Genus) %>% mutate(order = row_number())
+
+# Plot likelihoods
+res_sum <- full_all %>% group_by(Genus,State) %>% sum_stats(Proportion)
+res_sum$Genus <- factor(res_sum$Genus,levels=rev(genus_df$Genus))
+state_plot <- res_sum %>% ggplot(aes(y=Genus,x=mean,fill=State,xmin=conf_low,xmax=conf_high))+
+  geom_errorbar(width=0.25)+
+  geom_point(size=2.5,pch=22)+
+  scale_fill_manual(values=cols)+
+  theme_bw()+
+  theme(legend.position='top')
+state_plot
+
+ggsave('../../figures/20251014_Reconstruction_Sorenson_Overwintering_Targets_N142.pdf',height=4.5,width=2.5,state_plot)
+
+# Save summary text
+save_df <- res_sum %>%
+  mutate(
+    label = glue("{round(mean, 2)} ({round(conf_low, 2)}-{round(conf_high, 2)})")
+  ) %>%
+  select(Genus, State, label) %>%
+  pivot_wider(
+    names_from = State,
+    values_from = label
+  )
+save_df
+write.csv(save_df,file='20251015_Overwintering_Summary_N142.csv')
 ```
 
 
 
 
 
+### Subset N=45
+
+```
+#### Plot & estimate species tree 
+setwd('~/EvoBioWolf/CUCKOO_migration/reconstruction/')
+.libPaths('~/r_libs/')
+library(ggtree)
+library(ape)
+library(tidyverse)
+library(treeio)
+library(phytools)
+
+
+### read in data 
+phenos <- read_tsv('N45_Phenotypes.txt')
+phenotypes <- setNames(phenos$Residency, phenos$new_label)
+
+m = read.iqtree('N45_Tree.tre')
+m1 = treeio::root(as.phylo(m),outgroup='Pachycoccyx_audeberti',resolve.root=TRUE)
+
+#Plot probabilities 
+t2 <- multi2di(m1)
+
+# Quick ape method 
+fitER <- ape::ace(phenotypes,t2,model="ER",type="discrete")
+
+# Determine ancestral state likelihood number of shifts using MCMC
+simfull <- make.simmap(t2, phenotypes, model="ER", nsim=100,Q='mcmc')
+save.image(file = "Residency_workspace.RData")
+
+target_genera <- c(
+  "Pachycoccyx", "Ceuthmochares", "Clamator", "Scythrops", "Microdynamis",
+  "Eudynamys", "Chrysococcyx", "Cacomantis", "Surniculus",
+  "Cercococcyx", "Hierococcyx", "Cuculus"
+)
+
+# 5. Summarize results
+summary_sims <- describe.simmap(sims)
+
+## helper: count transitions within a genus for one simmap
+count_transitions_genus <- function(simmap, tips, all_states) {
+  if (length(tips) < 2) {
+    M <- matrix(0, length(all_states), length(all_states),
+                dimnames = list(all_states, all_states))
+    return(M)
+  }
+  sub_tr <- keep.tip(simmap, tips)
+  d <- phytools::describe.simmap(sub_tr)$N  # from x to y counts
+  # coerce to full state-by-state matrix
+  M <- matrix(0, length(all_states), length(all_states),
+              dimnames = list(all_states, all_states))
+  rn <- intersect(rownames(d), all_states)
+  cn <- intersect(colnames(d), all_states)
+  if (length(rn) && length(cn)) M[rn, cn] <- d[rn, cn]
+  diag(M) <- 0
+  M
+}
+
+## Accumulate counts across simulations
+sim_df <- map_dfr(seq_along(sims), function(i) {
+  simmap <- sims[[i]]
+  map_dfr(seq_len(nrow(genus_tips)), function(gi) {
+    gname <- genus_tips$Genus[gi]
+    tips  <- genus_tips$tips[[gi]]
+    M <- count_transitions_genus(simmap, tips, states)
+    as_tibble(as.table(M), .name_repair = "minimal") |>
+      rename(from = Var1, to = Var2, count = n) |>
+      mutate(genus = gname, sim = i)
+  })
+})
+
+## Summaries per genus and transition
+summ <- sim_df |>
+  group_by(genus, from, to) |>
+  summarize(mean_count = mean(count),
+            sd_count   = sd(count),
+            median_count = median(count),
+            q025 = quantile(count, 0.025),
+            q975 = quantile(count, 0.975),
+            .groups = "drop")
+
+## Add per-genus totals and proportions
+genus_totals <- summ |>
+  group_by(genus) |>
+  summarize(total_mean_transitions = sum(mean_count), .groups="drop")
+
+results <- summ |>
+  left_join(genus_totals, by = "genus") |>
+  mutate(prop_of_genus = ifelse(total_mean_transitions > 0,
+                                mean_count / total_mean_transitions, NA_real_)) |>
+  arrange(genus, from, to)
+
+## Nice compact table: only off-diagonals and only your four focal states
+focal_states <- c("II","AA","APe","APw")
+results_focal <- results |>
+  filter(from %in% focal_states, to %in% focal_states, from != to)
+
+# View a few examples
+results_focal %>% arrange(desc(mean_count)) %>% print(n = 40)
+
+# Optional: heatmap per genus (mean counts)
+# library(ggplot2)
+# ggplot(results_focal, aes(from, to, fill = mean_count)) +
+#   geom_tile() + facet_wrap(~ genus, scales = "free") +
+#   geom_text(aes(label = round(mean_count, 1))) +
+#   scale_fill_viridis_c() + theme_bw() +
+#   labs(title = "Within-genus route transitions (mean across SIMMAPs)",
+#        x = "From", y = "To", fill = "Mean\ncount")
+
+## Deterministic fallback (no SIMMAP, single ML argmax):
+ml_node_states <- apply(fitER2$lik.anc, 1, function(p) names(which.max(p)))
+# Build a named vector of states for ALL nodes (tips + internal)
+node_ids <- 1:(Ntip(t2) + t2$Nnode)
+tip_ids  <- 1:Ntip(t2)
+int_ids  <- (Ntip(t2)+1):(Ntip(t2)+t2$Nnode)
+
+state_by_node <- character(length(node_ids))
+names(state_by_node) <- node_ids
+# tip states by order of t2$tip.label
+state_by_node[tip_ids] <- as.character(phenotypes2[t2$tip.label])
+# internal node states in the order ape uses
+state_by_node[int_ids] <- ml_node_states[as.character(int_ids)]
+
+edges <- as_tibble(t2$edge, .name_repair="minimal") |>
+  rename(parent = V1, child = V2) |>
+  mutate(from = state_by_node[as.character(parent)],
+         to   = state_by_node[as.character(child)],
+         change = from != to)
+
+# For each genus, restrict to the clade and count parent->child changes inside it
+ml_counts <- map_dfr(genus_tips$Genus, function(gname){
+  tips <- genus_tips$tips[[match(gname, genus_tips$Genus)]]
+  sub_nodes <- keep.tip(t2, tips)
+  keep_edge_hash <- paste(sub_nodes$edge[,1], sub_nodes$edge[,2], sep = "_")
+  edge_hash <- paste(edges$parent, edges$child, sep = "_")
+  sub_edges <- edges[edge_hash %in% keep_edge_hash,]
+  sub_edges |>
+    filter(change, from %in% focal_states, to %in% focal_states) |>
+    count(from, to, name="ml_count") |>
+    mutate(genus = gname, .before = 1)
+})
+
+ml_counts %>% arrange(genus, desc(ml_count)) %>% print(n = 40)
+
+
+# Calculate average transitions for each genus 
+calculate_statistics <- function(mat, prefix) {
+  # Identify columns that contain the specific egg prefix
+  relevant_cols <- grep(paste0("^", prefix, ",E|E,", prefix, "$"), col_names, value = TRUE)
+  
+  # Sum the values in these columns
+  total_transitions <- rowSums(mat[, relevant_cols])
+  
+  # Calculate statistics
+  stats <- list(
+    Mean = mean(total_transitions),
+    Median = median(total_transitions),
+    SD = sd(total_transitions)
+  )
+  
+  return(stats)
+}
+
+# Apply to each E group
+E_groups <- spegg %>% select(Egg) %>% unique %>% pull(Egg)
+averages <- sapply(E_groups, function(E) calculate_statistics(mat, E))
+
+egg_shifts <- as.data.frame(t(averages)) %>% mutate(Egg = rownames(.), Tree = tree, Species = sp)
+rownames(egg_shifts) <- NULL
+
+full_tree_results[[paste0(sp,'_',tree)]] <- shifts
+full_egg_results[[paste0(sp,'_',tree)]] <- egg_shifts
+
+# Extract nodes and the proportions for pies
+nodes <- data.frame(
+  node=1:t2$Nnode+Ntip(t2),
+  fitER$lik.anc)
+
+# For stochastic mapping 
+obj <- describe.simmap(simfull,plot=FALSE)
+mcmc_nodes <- as.data.frame(cbind(node=rownames(obj$ace),obj$ace)); rownames(mcmc_nodes) <- NULL
+mcmc_nodes <- mcmc_nodes %>% mutate(across(starts_with('E'), as.numeric))
+nodes_plot <- mcmc_nodes %>% filter(node %in% nodes$node)
+rownames(nodes_plot) <- nodes_plot$node
+nodes_plot$node <- as.integer(nodes_plot$node)
+
+## cols parameter indicate which columns store stats
+pies <- nodepie(nodes_plot, cols=2:ncol(nodes_plot),outline.color='black',outline.size = 0.1)
+pies <- lapply(pies, function(g) g+scale_fill_manual(values = spegg$EggCol,breaks=spegg$Egg))
+
+t3 <- full_join(t2, data.frame(label = names(phenotypes), stat = phenotypes ), by = 'label')
+tp <- ggtree(t3,layout='rectangular',branch.length = 'none') %<+% md
+tp$data$dummy <- 1
+tp_final <- tp + geom_inset(pies, width = .09, height = .09)
+tp_phenos <- tp_final +
+  geom_tippoint(aes(fill=Haplogroup),pch=21,size=1.5)+
+  scale_fill_manual(values=md$HaplogroupColor,breaks=md$Haplogroup)
+assign(paste0(sp,'_',tree,'_nodes'),tp_final)
+assign(paste0(sp,'_',tree,'_pies'),tp_phenos)
+
+# Grab the model results
+full_search_res <- rbindlist(full_tree_results)
+full_search_res %>% group_by(Tree,Species,MLloglik,MLest,MLse) %>% sum_stats(shifts)
+
+# Also bind the egg data 
+full_search_eggs <- rbindlist(full_egg_results)
+full_search_eggs
+full_search_eggs$Mean <- unlist(full_search_eggs$Mean)
+full_search_eggs$Median <- unlist(full_search_eggs$Median)
+full_search_eggs$SD <- unlist(full_search_eggs$SD)
+
+write.table(full_search_res,file='20250401_Full_Search_Results.txt',quote=F,sep='\t',row.names=F)
+write.table(full_search_eggs,file='20250401_Full_Search_EggResults.txt',quote=F,sep='\t',row.names=F)
+
+```
+
+
+
 
 
 ## ADMIXTURE + Tesselation Figures
+
+This will run on 3 groups: each species individually, and both species combined 
 
 Resubsetting samples:
 
@@ -2151,332 +3818,441 @@ admixture -j7 --cv=5 ${bedfiles}/${GROUP}-n261.MQ-5X-MM1-AA-LDr2w50.bed ${K} > $
 
 ```
 
-The follow R script will make these plots:
+This R script will: 
 
-* evalAdmix plots
+* plot evalAdmix for clusters (K2-5)
+* plot ADMIXTURE bar plots for canorus + optatus
+* plot tesselation and pie charts for canorus
 
-* structure plots
+```
+### Plot ADMIXTURE
+setwd('~/EvoBioWolf/CUCKOO_migration/')
+.libPaths('~/r_libs/')
+library(tidyverse)
+library(RColorBrewer)
+library(meRo)
+library(sf)
+library(rworldmap)
+library(tess3r)
+library(ggnewscale)
 
-* tesselation plots for K = 2
+admix_run = c("CanorusOptatus-n261.MQ-5X-MM1-AA-LDr2w50")
+qdir = 'admixture/full_qs/' #directory with Q files
 
-* tesselation plots with pie charts for K  = 2 - 5
+cat('Working on run: ',admix_run,'\n')
+admix = melt_admixture(prefix = admix_run, qdir = qdir)
 
-* blank map plot with the study extent
+#read in metadata
+md = read_tsv('Full_Metadata.txt')
 
-* map with the sampling of the population genetic samples
+# Change optatus east to just gray
+md <- md %>% mutate(Population = ifelse(Population == 'COE',NA,Population),
+                    PopColor = ifelse(Population=='COE','grey60',PopColor))
 
-  ````
-  ### Plot ADMIXTURE
-  setwd('~/merondun/cuculus_migration/admixture/full_qs/')
-  .libPaths('~/mambaforge/envs/r/lib/R/library')
-  library(terra)
-  library(tidyverse)
-  library(viridis)
-  library(stringr)
-  library(meRo) #devtools::install_github('merondun/meRo')
-  library(LEA) #install with bioconductor, you don't actually need this if you impot your own q-matrix
-  library(tess3r) #install with github devtools
-  library(rworldmap) #for ggplot mapping 
-  library(sf) #for spatial plotting of distance vectors to confirm
-  library(ggspatial) #to add scale bars onto maps
-  library(ggpubr)
-  library(RColorBrewer)
-  library(ggnewscale)
-  library(scales)
-  
-  prefixes = gsub('.2.Q','',list.files('.',pattern='.*.2.Q'))
-  prefixes = c("Canorus-n261.MQ-5X-MM1-AA-LDr2w50","Optatus-n261.MQ-5X-MM1-AA-LDr2w50")
-  qdir = '.' #directory with Q files
-  counter = 0 
-  cols = brewer.pal(8,'Paired')[c(3,4,7,8)]
-  
-  for (admix_run in prefixes) { 
-    counter = counter + 1
-    cat('Working on run: ',admix_run,'\n')
-    
-    #Set if else parameters for colors, species, and shape based on the prefix string 
-    if(grepl('Canorus',admix_run)){ 
-      colz=cols[c(2,1)]; sp='CC'; spshape=21; filt='Cuculus canorus'
-    } else {
-      colz=cols[c(3,4)]; sp='CO'; spshape=24; filt = 'Cuculus optatus'
-    }
-    
-    prefix = admix_run 
-    admix = melt_admixture(prefix = prefix, qdir = qdir)
-    
-    #read in metadata
-    md = read_tsv('~/merondun/cuculus_migration/Full_Metadata.txt')
-    
-    # Change optatus east to just gray
-    md <- md %>% mutate(Population = ifelse(Population == 'COE',NA,Population),
-                        PopColor = ifelse(Population=='COE','grey60',PopColor))
-    
-    # Assign groups based on the n=40 demographic inference subset
-    n40 = read_tsv('~/merondun/cuculus_migration/Samples_Demography_N10_CCW-CCE-COW-COE_2024MAR13.pop',col_names = F)
-    names(n40) = c('ID','Group')
-    md = md %>% left_join(.,n40) %>% mutate(GroupBinary = ifelse(is.na(Group),'Other','Target'),
-                                            Group = ifelse(is.na(Group),'Other',Group))
-    
-    # Only retain unrelated samples, no toepads
-    md_sub = md %>% filter(SpeciesShort == sp)
-    
-    #md = read_tsv('~/merondun/cuculus_migration/ebird/Metadata_Breeding_2024APR24.txt')
-    admixmd = left_join(md_sub,admix)
-    
-    # Reorder individuals baseed on longitude
-    admixmd = admixmd %>% mutate(ID = fct_reorder(ID,Longitude))
-    
-    #loop through all admixture runs and extract the average correlation values from evalAdmix, we want to MINIMIZE this! (closest to 0)
-    evaldat = NULL; for (Kval in seq(2,10,1)){
-      r <- as.matrix(read.table(paste0("eval_",admix_run,'_',Kval)))
-      mean_value <- mean(r,na.rm=TRUE)
-      median_value <- median(r,na.rm=TRUE)
-      sd_value <- sd(r,na.rm=TRUE)
-      iqr_value <- IQR(r,na.rm=TRUE)
-      valdat = data.frame(K = Kval,mean = mean_value,median=median_value,sd=sd_value,iqr=iqr_value)
-      evaldat = rbind(valdat,evaldat)
-    }
-    
-    #plot, for main figure show the n=3 lowest median
-    targs = evaldat %>% slice_min(abs(median),n=3)
-    ep = evaldat %>% 
-      ggplot(aes(x=K,y=median,ymin=median-iqr,ymax=median+iqr))+
-      geom_rect(data=targs,aes(xmin=K-0.25,xmax=K+0.25,ymin=-Inf,ymax=Inf),fill='darkseagreen3')+
-      geom_text(aes(y = 0.014, label = format(signif(median, 2), scientific = TRUE)),size=2) +  ylim(c(-0.015,0.015))+
-      geom_hline(yintercept=0,lty=2)+
-      geom_point()+ylab('Median +/- IQR Correlation of Residuals') +
-      geom_errorbar()+
-      theme_bw() + 
-      scale_x_continuous(breaks = seq(min(evaldat$K), max(evaldat$K), by = 1)) +
-      coord_flip()
-    ep
-    assign(paste0('e',1),ep)
-    
-    ggsave(paste0('~/merondun/cuculus_migration/figures/20250115_evalAdmix_',sp,'.pdf'),e1,height=5,width=6,dpi=600)
-    
-    #Now plot ADMIXTURE 
-    adplot =
-      admixmd %>% filter(Specified_K == 2 ) %>%  #specify the levels you want 
-      mutate(Specified_K = paste0('K',Specified_K)) %>% 
-      ggplot(aes(x = factor(ID), y = Q, fill = factor(K), col=GroupBinary)) +
-      geom_col(size = 0.1) +
-      facet_grid(Specified_K~Species, scales = "free", space = "free") +
-      theme_minimal(base_size=6) + labs(x = "",y = "") +
-      scale_y_continuous(expand = c(0, 0),n.breaks = 3) +
-      scale_fill_manual(values=colz)+
-      scale_color_manual(values=c('gray','black'))+
-      theme(
-        panel.spacing.x = unit(0.1, "lines"),
-        #axis.text.x = element_blank(),
-        axis.text.x=element_text(angle=90,size=5),
-        axis.text.y = element_text(size=3),
-        panel.grid = element_blank(),
-        legend.position = 'bottom',
-        plot.title = element_text(size=6)
-      )
-    adplot
-    assign(paste0('p',counter),adplot)
-    
-    ggsave(paste0('~/merondun/cuculus_migration/figures/20250115_Admixture_',sp,'.pdf'),adplot,height=2.5,width=6,dpi=600)
-    
-    #save the K1/K2 Q values:
-    qval = admixmd %>% filter(Specified_K == 2 & K == 'K1') %>% select(ID,K1 = Q)
-    write.table(qval,paste0('~/merondun/cuculus_migration/admixture/Assigned_K2_Qvalues_',prefix,'.txt'),quote=F,sep='\t',row.names=F)
-    
-    ### Tesselation
-    # Import birdlife shapefiles, breeding == 2, presence ==1 means extant
-    bg <-  st_read('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/birdlife_breeding_distributions/SppDataRequest.shp')
-    filtered_data <- bg[bg$PRESENCE == 1 & bg$SEASONAL == 2 & bg$SCI_NAME == filt, ]
-    
-    #which K value to plot 
-    show_k = 2
-    
-    # Import Q, and then merge with the fam file to get the IDs to retain
-    show_q = read.table(paste0(qdir,'/',admix_run,'.',show_k,'.Q')) #read in the specific file
-    fam = read_tsv(paste0(prefix,'.fam'),col_names = F) %>% select(X2) %>% dplyr::rename(ID = X2)
-    all_q = cbind(show_q,fam)
-    
-    # This will only retain the individuals from the admixture lot 
-    retain_input = left_join(admixmd %>% select(ID,Group,Latitude,Longitude) %>% unique,all_q)
-    show_q_mat = as.matrix(retain_input %>% select(V1,V2)) #convert it to a matrix
-    class(show_q_mat) = c('tess3Q','matrix','array') #make sure tess3r thinks that it's actually a tess object
-    coords = retain_input %>% select(Longitude,Latitude) #convert lat and long
-    coords_mat = as.matrix(coords) #convert coordinates to matrix
-    
-    #plot using ggplot
-    map.polygon <- getMap(resolution = "high")
-    # Jitter the lat/long 
-    sitesp = st_as_sf(retain_input %>% select(ID,Group,Longitude,Latitude) %>% distinct %>% 
-                        mutate(loj = jitter(Longitude,amount=0.5),laj = jitter(Latitude,amount=0.5)),remove = F, coords = c("loj", "laj"), crs = 4326, agr = "constant") 
-    sitesp = sitesp %>% mutate(Kept = ifelse(Group == 'Other','Stronghold','Other'))
-    pl = ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = colz)
-    k2p1 = pl +
-      geom_path(data = map.polygon, aes(x = long, y = lat, group = group),col='white',lwd=0.2) +
-      coord_sf(xlim = c(-20,185), 
-               ylim = c(-30,75), expand = FALSE)+  
-      new_scale_fill()+
-      new_scale_color()+
-      geom_point(data = sitesp, aes(x = loj, y = laj,fill=Group,alpha=Kept),shape=spshape, size = 2,col='black') +
-      scale_fill_manual(values=md$PopColor,breaks=md$Population)+
-      scale_alpha_manual(values=c(0.8,0.2))+
-      xlab("Longitude") + ylab("Latitude") + 
-      theme_classic(base_size=8)+
-      theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
-      theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
-    k2p1
-    
-    ggsave(paste0('~/merondun/cuculus_migration/figures/20250115_Tesselation_',sp,'.pdf'),k2p1,height=4,width=7,dpi=300)
-    
-    #plot all K...
-    maximum_k = 5
-    for (kval in seq(2,maximum_k,1)) {
-      
-      cat('Working on K = ',kval,'\n')
-      # Import Q, and then merge with the fam file to get the IDs to retain
-      show_q = read.table(paste0(qdir,'/',admix_run,'.',kval,'.Q')) #read in the specific file
-      fam = read_tsv(paste0(prefix,'.fam'),col_names = F) %>% select(X2) %>% dplyr::rename(ID = X2)
-      all_q = cbind(show_q,fam)
-      
-      # This will only retain the individuals from the admixture lot 
-      retain_input = left_join(admixmd %>% select(ID,Group,Latitude,Longitude) %>% unique,all_q)
-      show_q_mat = as.matrix(retain_input %>% select(matches('V'))) #convert it to a matrix
-      class(show_q_mat) = c('tess3Q','matrix','array') #make sure tess3r thinks that it's actually a tess object
-      coords = retain_input %>% select(Longitude,Latitude) #convert lat and long
-      coords_mat = as.matrix(coords) #convert coordinates to matrix
-      
-      # First, grab the individuals and calculate the mean Q values within each cluster. Cluster will be geographic reigon, also calculate mean lat/long for plotting
-      kept = admixmd %>% select(ID,Specified_K,K,Q,Latitude,Longitude,Group = GeographicGroup)
-      group_summaries = kept %>% 
-        filter(Specified_K == kval) %>%
-        group_by(Group,K) %>%  #within each group and K, average lat/long/q and count number of individuals 
-        summarize(Lat = mean(Latitude),
-                  Long = mean(Longitude),
-                  Q = mean(Q),
-                  N = n_distinct(ID)) %>% 
-        ungroup() %>% #
-        #Calculate scaling factors for the pies based on num samples
-        mutate(MinN = min(N),
-               MaxN = max(N)) %>%
-        group_by(Group) %>%
-        mutate(Scaling_factor = ((N - MinN) / (MaxN - MinN) * 10) + 2) %>%
-        select(-MinN, -MaxN) 
-      
-      ##### Plot pies across the world 
-      plot_pie <- function(data) {
-        ggplot(data, aes(x = "", y = Q, fill = K,)) +
-          geom_bar(col='white',lwd=0.5,width = 1, stat = "identity") +
-          coord_polar("y") +
-          scale_fill_viridis(discrete=TRUE)+
-          theme_void() +
-          theme(legend.position = "none")
-      }
-      
-      #set up map and make a sf object from the summaries 
-      sites = st_as_sf(group_summaries, coords = c("Long", "Lat"), crs = 4326, agr = "constant") 
-      
-      # Main map plot
-      p = 
-        ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = viridis(kval)) + 
-        geom_path(data = map.polygon, aes(x = long, y = lat, group = group)) +
-        geom_sf(data = sites, aes(geometry = geometry), size = 0.1, alpha = 0.1, pch=26) +
-        xlab('')+ylab('')+
-        coord_sf(xlim = c(min(group_summaries$Long)-5, max(group_summaries$Long)+5), 
-                 ylim = c(min(group_summaries$Lat)-5, max(group_summaries$Lat)+5), expand = FALSE)+
-        theme_classic(base_size = 8)+
-        theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
-        theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
-      p
-      
-      # Add pies
-      for (i in unique(group_summaries$Group)) {
-        subset_data = group_summaries %>% filter(Group == i)
-        lon = unique(subset_data$Long)
-        lat = unique(subset_data$Lat)
-        scale_factor = unique(subset_data$Scaling_factor)
-        cat('Scaling factor is : ',scale_factor,' for group : ',i,'\n')
-        pie = plot_pie(subset_data)
-        p <- p + annotation_custom(ggplotGrob(pie), 
-                                   xmin = lon - scale_factor, 
-                                   xmax = lon + scale_factor, 
-                                   ymin = lat - scale_factor, 
-                                   ymax = lat + scale_factor)
-      }
-      p
-      assign(paste0('t',kval),p)
-      
-    }
-    
-    png(paste0('~/merondun/cuculus_migration/figures/20250115_Tesselation_',admix_run,'_AllK.png'),res=600,units='in',height=7,width=10)
-    print(ggarrange(t2,t3,t4,t5,ncol=2,nrow=2))
-    dev.off()
-    
-  }
-  
-  
-  ###### Blank plot ######
-  #Create a small psuedo region for plotting the tesselation, makes a small file size 
-  coords <- matrix(c(50, 60, 51, 60, 51, 61, 50, 61, 50, 60), ncol = 2, byrow = TRUE)
-  polygon <- st_polygon(list(coords))
-  sf_df <- st_sf(geometry = st_sfc(polygon))
-  
-  #plot using ggplot
-  map.polygon <- getMap(resolution = "high")
-  b = ggtess3Q(show_q_mat, coords_mat, map.polygon = sf_df,col.palette = rev(cols))
-  blank = b +
-    geom_polygon(data = map.polygon, aes(x = long, y = lat, group = group),fill='white',col='grey90',lwd=0.2) +
-    coord_sf(xlim = c(-20,185), 
-             ylim = c(-30,75), expand = FALSE)+  
-    new_scale_fill()+
-    new_scale_color()+
-    geom_point(data = sitesp, aes(x = loj, y = laj,fill=Group,alpha=Kept),shape=26,size = 2,col='black') +
-    xlab("Longitude") + ylab("Latitude") + 
-    theme_classic(base_size=8)+
-    theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
-    theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
-  blank
-  
-  ggsave(paste0('~/merondun/cuculus_migration/figures/20241023_Tesselation_Blank.pdf'),blank,height=4,width=7,dpi=300)
-  
-  #### Add individual points ####
-  sitesp = st_as_sf(md %>% filter(Analysis_ADMIXTURE_All == 1) %>% select(ID,Group,Longitude,Latitude,SpeciesShort) %>% distinct %>% mutate(loj = jitter(Longitude,amount=1),laj = jitter(Latitude,amount=1)),remove = F, coords = c("loj", "laj"), crs = 4326, agr = "constant") 
-  sitesp = sitesp %>% mutate(Kept = ifelse(Group == 'Other','Stronghold','Other'))
-  pos = b +
-    geom_polygon(data = map.polygon, aes(x = long, y = lat, group = group),fill='white',col='grey90',lwd=0.2) +
-    coord_sf(xlim = c(-20,185), 
-             ylim = c(-30,75), expand = FALSE)+  
-    new_scale_fill()+
-    new_scale_color()+
-    geom_point(data = sitesp, aes(x = loj, y = laj,fill=Group,alpha=Kept,shape=SpeciesShort), size = 2,col='black') +
-    scale_fill_manual(breaks=c('CCW','CCE','COW','COE','Other'),values=c("#1F78B4","#A6CEE3","#E31A1C","#FB9A99","white" ))+
-    xlab("Longitude") + ylab("Latitude") + 
-    scale_shape_manual(values=c(21,24))+
-    guides(fill=guide_legend(nrow=2,override.aes=list(shape=22)))+
-    scale_alpha_manual(values=c(0.8,0.4))+
-    theme_classic(base_size=8)+
-    theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
-    theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
-  pos
-  
-  pdf('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/figures/PopGenLocations_Map_Tesselation_2024MAY14.pdf',height=4,width=7)
-  pos
-  dev.off()
-  ````
-  
-  
+# Assign groups based on the n=40 demographic inference subset
+n40 = read_tsv('~/merondun/cuculus_migration/Samples_Demography_N10_CCW-CCE-COW-COE_2024MAR13.pop',col_names = F)
+names(n40) = c('ID','Group')
+md = md %>% left_join(.,n40) %>% mutate(GroupBinary = ifelse(is.na(Group),'Other','Target'),
+                                        Group = ifelse(is.na(Group),'Other',Group))
 
-![image-20250122103827205](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20250122103827205.png)
+admixmd = left_join(admix,md)
 
-Structure plots for canorus and optatus, run separately
+# Reorder individuals baseed on longitude
+admixmd = admixmd %>% mutate(ID = fct_reorder(ID,Longitude))
 
-![image-20250122104134393](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20250122104134393.png)
+#loop through all admixture runs and extract the average correlation values from evalAdmix, we want to MINIMIZE this! (closest to 0)
+evaldat = NULL; for (Kval in seq(2,5,1)){
+  r <- as.matrix(read.table(paste0(qdir,"/eval_",admix_run,'_',Kval)))
+  mean_value <- mean(r,na.rm=TRUE)
+  median_value <- median(r,na.rm=TRUE)
+  sd_value <- sd(r,na.rm=TRUE)
+  iqr_value <- IQR(r,na.rm=TRUE)
+  valdat = data.frame(K = Kval,mean = mean_value,median=median_value,sd=sd_value,iqr=iqr_value)
+  evaldat = rbind(valdat,evaldat)
+}
 
-Inferred tesselations of ancestry projected across geographic space for K=2, separately for canorus and optatus, and clipped to birdlife international's breeding extant range.
+#plot, for main figure show the n=3 lowest median
+targs = evaldat %>% slice_min(abs(median),n=1)
+ep = evaldat %>% 
+  ggplot(aes(x=K,y=median,ymin=median-iqr,ymax=median+iqr))+
+  geom_rect(data=targs,aes(xmin=K-0.25,xmax=K+0.25,ymin=-Inf,ymax=Inf),fill='darkseagreen3')+
+  geom_text(aes(y = 0.014, label = format(signif(median, 2), scientific = TRUE)),size=2) +  ylim(c(-0.015,0.015))+
+  geom_hline(yintercept=0,lty=2)+
+  geom_point()+ylab('Median +/- IQR Correlation of Residuals') +
+  geom_errorbar()+
+  theme_bw() + 
+  scale_x_continuous(breaks = seq(min(evaldat$K), max(evaldat$K), by = 1)) +
+  coord_flip()
+ep
 
-![image-20250122104905746](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20250122104905746.png)
+ggsave('figures/20251007_evalAdmix_CanorusOptatus.pdf',ep,height=5,width=4,dpi=600)
 
-Tesselations for K2 - K5 with pie charts showing proportions of ancestry within each region
+cols <- md %>% select(Population,PopColor) %>% distinct %>% na.omit %>% arrange(desc(Population)) %>% mutate(Population = gsub('COW','CO',Population))
+colp <- cols$PopColor
+names(colp) <- cols$Population
+
+#Now plot ADMIXTURE 
+adplot =
+  #admixmd %>% filter(Specified_K == 3) %>%  #specify the levels you want 
+  admixmd %>% filter(Specified_K == 3) %>%  #specify the levels you want 
+  mutate(Specified_K = paste0('K',Specified_K)) %>% 
+  ggplot(aes(x = factor(ID), y = Q, fill = factor(K), col=GroupBinary)) +
+  geom_col(size = 0.1) +
+  facet_grid(Specified_K~Species, scales = "free", space = "free") +
+  theme_minimal(base_size=6) + labs(x = "",y = "") +
+  scale_y_continuous(expand = c(0, 0),n.breaks = 3) +
+  scale_fill_manual(values=cols$PopColor[c(3,1,2)])+
+  scale_color_manual(values=c('gray','black'))+
+  theme(
+    panel.spacing.x = unit(0.1, "lines"),
+    axis.text.x = element_blank(),
+    #axis.text.x=element_text(angle=90,size=5),
+    axis.text.y = element_text(size=3),
+    panel.grid = element_blank(),
+    legend.position = 'bottom',
+    plot.title = element_text(size=6)
+  )
+adplot
+
+ggsave(paste0('figures/20251007_Admixture_CanorusOptatus.pdf'),adplot,height=1.5,width=7.25,dpi=600)
+
+# plot k 2 - 5
+#Now plot ADMIXTURE 
+adplot_all =
+  admixmd %>% filter(Specified_K <=5) %>%  #specify the levels you want 
+  mutate(Specified_K = paste0('K',Specified_K)) %>% 
+  ggplot(aes(x = factor(ID), y = Q, fill = factor(K))) +
+  geom_col(size = 0.1) +
+  facet_grid(Specified_K~Species, scales = "free", space = "free") +
+  theme_minimal(base_size=6) + labs(x = "",y = "") +
+  scale_y_continuous(expand = c(0, 0),n.breaks = 3) +
+  scale_fill_manual(values=brewer.pal(5,'Paired'))+
+  theme(
+    panel.spacing.x = unit(0.1, "lines"),
+    axis.text.x = element_blank(),
+    #axis.text.x=element_text(angle=90,size=5),
+    axis.text.y = element_text(size=3),
+    panel.grid = element_blank(),
+    legend.position = 'bottom',
+    plot.title = element_text(size=6)
+  )
+adplot_all
+
+ggsave(paste0('figures/20251007_Admixture_CanorusOptatus_K2-5.pdf'),adplot_all,height=4,width=7.25,dpi=600)
+
+# average maximum Q within canorus for optatus ancestry?
+admixmd %>% filter(Specified_K == 3 & SpeciesShort != 'CO' & K == 'K2') %>% group_by(ID) %>% slice_max(Q) %>% arrange(desc(Q))
+
+
+##### Plot tesselation #####
+sp <- 'canorus'
+kval=3
+
+# Import birdlife shapefiles, breeding == 2, presence ==1 means extant
+bg <-  st_read('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/birdlife_breeding_distributions/SppDataRequest.shp')
+filtered_data <- bg[bg$PRESENCE == 1 & bg$SEASONAL == 2 & bg$SCI_NAME == 'Cuculus canorus', ]
+
+show_q = read.table(paste0(qdir,'/',admix_run,'.',kval,'.Q')) #read in the specific file
+fam = read_tsv(paste0(qdir,'/',admix_run,'.fam'),col_names = F) %>% select(X2) %>% dplyr::rename(ID = X2)
+all_q = cbind(show_q,fam)
+
+# This will only retain the individuals from the admixture lot 
+retain_input = left_join(admixmd %>% filter(grepl('_CC_|_CB_',ID)) %>% select(ID,Group,Latitude,Longitude) %>% unique,all_q)
+show_q_mat = as.matrix(retain_input %>% select(matches('V'))) #convert it to a matrix
+class(show_q_mat) = c('tess3Q','matrix','array') #make sure tess3r thinks that it's actually a tess object
+coords = retain_input %>% select(Longitude,Latitude) #convert lat and long
+coords_mat = as.matrix(coords) #convert coordinates to matrix
+
+# First, grab the individuals and calculate the mean Q values within each cluster. Cluster will be geographic reigon, also calculate mean lat/long for plotting
+map.polygon <- getMap(resolution = "high")
+kept = admixmd %>% filter(grepl('_CC_|_CB_',ID)) %>% select(ID,Specified_K,K,Q,Latitude,Longitude,Group = GeographicGroup)
+group_summaries = kept %>% 
+  filter(Specified_K == kval) %>%
+  group_by(Group,K) %>%  #within each group and K, average lat/long/q and count number of individuals 
+  summarize(Lat = mean(Latitude),
+            Long = mean(Longitude),
+            Q = mean(Q),
+            N = n_distinct(ID)) %>% 
+  ungroup() %>% #
+  #Calculate scaling factors for the pies based on num samples
+  mutate(MinN = min(N),
+         MaxN = max(N)) %>%
+  group_by(Group) %>%
+  mutate(Scaling_factor = ((N - MinN) / (MaxN - MinN) * 10) + 2) %>%
+  select(-MinN, -MaxN) 
+
+##### Plot pies across the world 
+plot_pie <- function(data) {
+  ggplot(data, aes(x = "", y = Q, fill = K,)) +
+    geom_bar(col='black',lwd=0.2,width = 1, stat = "identity") +
+    coord_polar("y") +
+    scale_fill_manual(values=cols$PopColor[c(3,1,2)])+
+    theme_void() +
+    theme(legend.position = "none")
+}
+
+#set up map and make a sf object from the summaries 
+sites = st_as_sf(group_summaries, coords = c("Long", "Lat"), crs = 4326, agr = "constant") 
+
+# Main map plot
+p = 
+  ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = cols$PopColor[c(3,1,2)]) + 
+  geom_path(data = map.polygon, aes(x = long, y = lat, group = group),col='white',lwd=0.2) +
+  geom_sf(data = sites, aes(geometry = geometry), size = 0.1, alpha = 0.1, pch=26) +
+  xlab('')+ylab('')+
+  coord_sf(xlim = c(min(group_summaries$Long)-5, max(group_summaries$Long)+5), 
+           ylim = c(min(group_summaries$Lat)-5, max(group_summaries$Lat)+5), expand = FALSE)+
+  theme_classic(base_size = 8)+
+  coord_sf(xlim = c(-20,185), 
+           ylim = c(-30,75), expand = FALSE)+  
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
+  theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
+p
+
+# Add pies
+for (i in unique(group_summaries$Group)) {
+  subset_data = group_summaries %>% filter(Group == i)
+  lon = unique(subset_data$Long)
+  lat = unique(subset_data$Lat)
+  scale_factor = unique(subset_data$Scaling_factor)
+  cat('Scaling factor is : ',scale_factor,' for group : ',i,'\n')
+  pie = plot_pie(subset_data)
+  p <- p + annotation_custom(ggplotGrob(pie),
+                             xmin = lon - scale_factor,
+                             xmax = lon + scale_factor,
+                             ymin = lat - scale_factor,
+                             ymax = lat + scale_factor)
+}
+p
+
+ggsave('figures/20251007_Tesselation_Canorus.pdf',p,height=4,width=7)
+
+
+###### and also do optatus for the pies ######
+sp <- 'optatus'
+kval=3
+
+# Import birdlife shapefiles, breeding == 2, presence ==1 means extant
+bg <-  st_read('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/birdlife_breeding_distributions/SppDataRequest.shp')
+filtered_data <- bg[bg$PRESENCE == 1 & bg$SEASONAL == 2 & bg$SCI_NAME == 'Cuculus optatus', ]
+
+show_q = read.table(paste0(qdir,'/',admix_run,'.',kval,'.Q')) #read in the specific file
+fam = read_tsv(paste0(qdir,'/',admix_run,'.fam'),col_names = F) %>% select(X2) %>% dplyr::rename(ID = X2)
+all_q = cbind(show_q,fam)
+
+# This will only retain the individuals from the admixture lot 
+retain_input = left_join(admixmd %>% filter(grepl('_CO_',ID)) %>% select(ID,Group,Latitude,Longitude) %>% unique,all_q)
+show_q_mat = as.matrix(retain_input %>% select(matches('V'))) #convert it to a matrix
+class(show_q_mat) = c('tess3Q','matrix','array') #make sure tess3r thinks that it's actually a tess object
+coords = retain_input %>% select(Longitude,Latitude) #convert lat and long
+coords_mat = as.matrix(coords) #convert coordinates to matrix
+
+# First, grab the individuals and calculate the mean Q values within each cluster. Cluster will be geographic reigon, also calculate mean lat/long for plotting
+map.polygon <- getMap(resolution = "high")
+kept = admixmd %>% filter(grepl('_CO_',ID)) %>% select(ID,Specified_K,K,Q,Latitude,Longitude,Group = GeographicGroup)
+group_summaries = kept %>% 
+  filter(Specified_K == kval) %>%
+  group_by(Group,K) %>%  #within each group and K, average lat/long/q and count number of individuals 
+  summarize(Lat = mean(Latitude),
+            Long = mean(Longitude),
+            Q = mean(Q),
+            N = n_distinct(ID)) %>% 
+  ungroup() %>% #
+  #Calculate scaling factors for the pies based on num samples
+  mutate(MinN = min(N),
+         MaxN = max(N)) %>%
+  group_by(Group) %>%
+  mutate(Scaling_factor = ((N - MinN) / (MaxN - MinN) * 10) + 2) %>%
+  select(-MinN, -MaxN) 
+
+#set up map and make a sf object from the summaries 
+sites = st_as_sf(group_summaries, coords = c("Long", "Lat"), crs = 4326, agr = "constant") 
+
+# Main map plot
+p = 
+  ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = cols$PopColor[c(3,1,2)]) + 
+  geom_path(data = map.polygon, aes(x = long, y = lat, group = group),col='white',lwd=0.2) +
+  geom_sf(data = sites, aes(geometry = geometry), size = 0.1, alpha = 0.1, pch=26) +
+  xlab('')+ylab('')+
+  coord_sf(xlim = c(min(group_summaries$Long)-5, max(group_summaries$Long)+5), 
+           ylim = c(min(group_summaries$Lat)-5, max(group_summaries$Lat)+5), expand = FALSE)+
+  theme_classic(base_size = 8)+
+  coord_sf(xlim = c(-20,185), 
+           ylim = c(-30,75), expand = FALSE)+  
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
+  theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
+p
+# 
+# # Add pies
+# for (i in unique(group_summaries$Group)) {
+#   subset_data = group_summaries %>% filter(Group == i)
+#   lon = unique(subset_data$Long)
+#   lat = unique(subset_data$Lat)
+#   scale_factor = unique(subset_data$Scaling_factor)
+#   cat('Scaling factor is : ',scale_factor,' for group : ',i,'\n')
+#   pie = plot_pie(subset_data)
+#   p <- p + annotation_custom(ggplotGrob(pie), 
+#                              xmin = lon - scale_factor, 
+#                              xmax = lon + scale_factor, 
+#                              ymin = lat - scale_factor, 
+#                              ymax = lat + scale_factor)
+# }
+# p
+
+ggsave('figures/20251007_Tesselation_Optatus.pdf',p,height=4,width=7)
+
+
+####### pies for both species ######
+sp <- 'canorus'
+kval=3
+
+show_q = read.table(paste0(qdir,'/',admix_run,'.',kval,'.Q')) #read in the specific file
+fam = read_tsv(paste0(qdir,'/',admix_run,'.fam'),col_names = F) %>% select(X2) %>% dplyr::rename(ID = X2)
+all_q = cbind(show_q,fam)
+
+# This will only retain the individuals from the admixture lot 
+retain_input = left_join(admixmd %>% select(ID,Group,Latitude,Longitude) %>% unique,all_q)
+show_q_mat = as.matrix(retain_input %>% select(matches('V'))) #convert it to a matrix
+class(show_q_mat) = c('tess3Q','matrix','array') #make sure tess3r thinks that it's actually a tess object
+coords = retain_input %>% select(Longitude,Latitude) #convert lat and long
+coords_mat = as.matrix(coords) #convert coordinates to matrix
+
+# First, grab the individuals and calculate the mean Q values within each cluster. Cluster will be geographic reigon, also calculate mean lat/long for plotting
+map.polygon <- getMap(resolution = "high")
+kept = admixmd %>% select(ID,Specified_K,K,Q,Latitude,Longitude,Group = GeographicGroup)
+group_summaries = kept %>% 
+  filter(Specified_K == kval) %>%
+  group_by(Group,K) %>%  #within each group and K, average lat/long/q and count number of individuals 
+  summarize(Lat = mean(Latitude),
+            Long = mean(Longitude),
+            Q = mean(Q),
+            N = n_distinct(ID)) %>% 
+  ungroup() %>% #
+  #Calculate scaling factors for the pies based on num samples
+  mutate(MinN = min(N),
+         MaxN = max(N)) %>%
+  group_by(Group) %>%
+  mutate(Scaling_factor = ((N - MinN) / (MaxN - MinN) * 10) + 2) %>%
+  select(-MinN, -MaxN) 
+
+#set up map and make a sf object from the summaries 
+sites = st_as_sf(group_summaries, coords = c("Long", "Lat"), crs = 4326, agr = "constant") 
+
+# Main map plot
+p = 
+  ggplot()+#ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = cols$PopColor[c(3,1,2)]) + 
+  geom_polygon(data = map.polygon, aes(x = long, y = lat, group = group),col='grey90',fill='white',lwd=0.2) +
+  geom_sf(data = sites, aes(geometry = geometry), size = 0.1, alpha = 0.1, pch=26) +
+  xlab('')+ylab('')+
+  coord_sf(xlim = c(min(group_summaries$Long)-5, max(group_summaries$Long)+5), 
+           ylim = c(min(group_summaries$Lat)-5, max(group_summaries$Lat)+5), expand = FALSE)+
+  theme_classic(base_size = 8)+
+  coord_sf(xlim = c(-20,185), 
+           ylim = c(-30,75), expand = FALSE)+  
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
+  theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
+p
+
+# Add pies
+for (i in unique(group_summaries$Group)) {
+  subset_data = group_summaries %>% filter(Group == i)
+  lon = unique(subset_data$Long)
+  lat = unique(subset_data$Lat)
+  scale_factor = unique(subset_data$Scaling_factor)
+  cat('Scaling factor is : ',scale_factor,' for group : ',i,'\n')
+  pie = plot_pie(subset_data)
+  p <- p + annotation_custom(ggplotGrob(pie), 
+                             xmin = lon - scale_factor, 
+                             xmax = lon + scale_factor, 
+                             ymin = lat - scale_factor, 
+                             ymax = lat + scale_factor)
+}
+p
+
+ggsave('figures/20251007_Pies_CanOpt.pdf',p,height=4,width=7)
+
+
+
+# Plot canorus plot with the migration tracks 
+library(sf)
+library(rworldmap)
+library(ggnewscale)
+library(DHARMa)
+library(ggpubr)
+library(giscoR)
+
+tracks_routes <- read_tsv('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/spatial/03-BoD-deaths-removed-no-NDVI_ClassifiedPhaseMigration.txt')
+can <- tracks_routes %>% filter(Direction != 'CO') 
+
+p = 
+  ggtess3Q(show_q_mat, coords_mat, map.polygon = filtered_data,col.palette = cols$PopColor[c(3,1,2)]) + 
+  geom_path(data = map.polygon, aes(x = long, y = lat, group = group),col='white',lwd=0.2) +
+  geom_sf(data = sites, aes(geometry = geometry), size = 0.1, alpha = 0.1, pch=26) +
+  # add tracks
+  geom_path(data = can, aes(x, y, group = ID), color = "grey60",alpha=0.8) +
+  geom_point(
+    data = can,
+    aes(x, y, group=ID, color = Phase, shape = Phase),
+    size = 1,alpha=0.8)+
+  xlab('')+ylab('')+
+  theme_classic(base_size = 8)+
+  coord_sf(xlim = c(-20,185), 
+           ylim = c(-30,75), expand = FALSE)+  
+  theme(panel.border = element_rect(colour = "black", fill=NA, size=1),panel.background = element_rect(fill = "aliceblue"))+
+  theme(legend.position = 'top',legend.text = element_text(size = 6),legend.title = element_text(size = 6),legend.key.size = unit(0.1, 'cm'))
+p
+
+plot_pie <- function(data) {
+  ggplot(data, aes(x = "", y = Q, fill = K,)) +
+    geom_bar(col='black',lwd=0.2,width = 1, alpha=0.7,stat = "identity") +
+    coord_polar("y") +
+    scale_fill_manual(values=cols$PopColor[c(3,1,2)])+
+    theme_void() +
+    theme(legend.position = "none")
+}
+
+# Add pies
+for (i in unique(group_summaries$Group)) {
+  subset_data = group_summaries %>% filter(Group == i)
+  lon = unique(subset_data$Long)
+  lat = unique(subset_data$Lat)
+  scale_factor = unique(subset_data$Scaling_factor)
+  cat('Scaling factor is : ',scale_factor,' for group : ',i,'\n')
+  pie = plot_pie(subset_data)
+  p <- p + annotation_custom(ggplotGrob(pie),
+                             xmin = lon - scale_factor,
+                             xmax = lon + scale_factor,
+                             ymin = lat - scale_factor,
+                             ymax = lat + scale_factor)
+}
+p
+
+ggsave('figures/20251007_Tesselation_Canorus_with_Tracks.png',p,height=4,width=7,dpi=600)
+
+
+###### Grab individuals for gene scan ######
+adplot
+ccw <- admixmd %>% filter(Specified_K == 3) %>% filter(K == 'K3' & Q > 0.95) %>% select(ID,Latitude,Longitude,Species,Shape,GeographicGroup) %>% mutate(GeneScanPopFull = 'CCW')
+cce <- admixmd %>% filter(Specified_K == 3) %>% filter(K == 'K1' & Q > 0.95) %>% select(ID,Latitude,Longitude,Species,Shape,GeographicGroup) %>% mutate(GeneScanPopFull = 'CCE')
+co <- admixmd %>% filter(Specified_K == 3) %>% filter(K == 'K2' & Q > 0.95) %>% select(ID,Latitude,Longitude,Species,Shape,GeographicGroup) %>% mutate(GeneScanPopFull = 'CO')
+genescan <- rbind(ccw,cce,co)
+
+map.polygon <- getMap(resolution = "high")
+genescan %>% 
+  ggplot() +
+  geom_path(data = map.polygon, aes(x = long, y = lat, group = group),col='white',lwd=0.2) +
+  geom_point(mapping = aes(Longitude, Latitude, col = GeneScanPopFull)) +
+  coord_sf(xlim = c(-20,185), 
+           ylim = c(-30,75), expand = FALSE)+
+  scale_color_manual(values=colp)
+out <- genescan %>% select(ID,GeneScanPopFull)
+write.table(out,file='/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/gene_hunt/GeneScanPopFull.txt',quote=F,sep='\t',row.names=F,col.names = F)
+
+```
 
 ## PCA
+
+Run PCA on each species individually, and also on the whole group:
 
 ```R
 setwd('~/merondun/cuculus_migration/admixture/')
@@ -2519,8 +4295,6 @@ for (group in groups) {
 }
 
 ```
-
-![image-20241023160342428](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20241023160342428.png)
 
 ## FST ~ Geographic Distance
 
@@ -2616,7 +4390,7 @@ for (pop in unique(analyze_these)) {
 
 ```
 
-![image-20250121112454635](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20250121112454635.png)
+
 
 Comparisons:
 
@@ -3129,36 +4903,6 @@ dev.off()
 
 ```
 
-First, ascribing a bounding box based on the genetic ancestry Q > 99% for west / east.
-
-![ADMIXTURE_StrongholdsK2_2024MAY15](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\ADMIXTURE_StrongholdsK2_2024MAY15.png)
-
-Strongholds of > 99% ancestry coefficients for western and eastern groups. Individuals with a mean breeding area within these boxes are assigned to each group. 
-
-![Migration_MonthlyDistances_2024MAY15](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\Migration_MonthlyDistances_2024MAY15.png)
-
-Distances traveled in each month
-
-![Migration_MeanMonthlyDistances_2024MAY15](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\Migration_MeanMonthlyDistances_2024MAY15.png)
-
-Mean monthly averages between fixes, seems like june and january are the best months to select for breeding and overwintering. 
-
-![ADMIXTURE_StrongholdsK2-Assigned_2024MAY15](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\ADMIXTURE_StrongholdsK2-Assigned_2024MAY15.png)
-
-For each individual's tracking data, I calculated the mean lat/long across all years in June. I then intersected this with the bounding boxes to assign each individual into a genetic stronghold. 
-
-We can then color the tracks based on the individual's ancestry:
-
-![Migration_Map_AssignedK2_2024MAY14](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\Migration_Map_AssignedK2_2024MAY14.png)
-
-Great, now let's identify overwintering locations for the 4 groups. Unfortunately we do not have ANY january locations for our optatus east samples, and only a single individual for optatus west, so we cannot make polygons for optatus.
-
-Put them together with the migration tracks:
-
-![Migration_Map_Overwintering_AssignedK2_2024MAY14](G:\My Drive\Research\Migration\tesselation\2024_05-UnrelatedChyiyin_Fastsimcoal\Migration_Map_Overwintering_AssignedK2_2024MAY14.png)
-
-
-
 ## Subset N = 40
 
 ```R
@@ -3246,12 +4990,6 @@ write.table(kept %>% ungroup %>% select(ID,Group),file='~/merondun/cuculus_migra
 write.table(kept %>% ungroup %>% select(ID),file='~/merondun/cuculus_migration/Samples_Demography_N10_CCW-CCE-COW-COE_2024APR26.list',quote=F,sep='\t',row.names=F,col.names=F)
 
 ```
-
-![image-20240426105716120](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20240426105716120.png)
-
-
-
-![image-20240426105815823](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20240426105815823.png)
 
 ### Subset Samples
 
@@ -3434,7 +5172,7 @@ write.table(kept %>% ungroup %>% select(ID),file='~/merondun/cuculus_migration/d
 
 ```
 
-![image-20241023140836565](C:\Users\herit\AppData\Roaming\Typora\typora-user-images\image-20241023140836565.png)
+
 
 And as before, subset for folded SFS:
 
@@ -4226,57 +5964,5 @@ pdf('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/ana
 mp2
 dev.off()
 
-```
-
-## LD
-
-```bash
-
-#!/bin/bash
-
-#SBATCH --get-user-env
-#SBATCH --mail-user=merondun@bio.lmu.de
-#SBATCH --clusters=biohpc_gen
-#SBATCH --partition=biohpc_gen_normal
-#SBATCH --cpus-per-task=3
-#SBATCH --time=48:00:00
-
-GROUP=$1
-
-#mamba activate snps
-VCF=/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/chromosome_vcfs/unrelated_chyiyin/chr_6_snp.MQ-5X-MM1.vcf.gz
-
-plink --vcf $VCF --keep ${GROUP}.plist --double-id --allow-extra-chr \
-        --set-missing-var-ids @:# \
-        --mac 2 --thin 0.01 --geno 0.1 \
-        -r2 gz --ld-window 999999 --ld-window-kb 1000 \
-        --ld-window-r2 0 \
-        --make-bed --out decay/${GROUP}
-
-zcat decay/${GROUP}.ld.gz | awk '{OFS="\t"}{print $2, $5, $7}' | gzip -c > decay/${GROUP}.ldout.gz
-
-```
-
-```R
-### Plot FST Scan 
-setwd('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/fst_scan/all_west_east/')
-.libPaths('~/mambaforge/envs/r/lib/R/library')
-library(tidyverse)
-library(meRo) #devtools::install_github('merondun/meRo')
-library(karyoploteR)
-
-# Load in LD
-library(data.table)
-ld <- fread('/dss/dsslegfs01/pr53da/pr53da-dss-0021/projects/2023__MigratoryGenomics/analyses/fst_scan/all_west_east/LD/decay/W_E.ldout.gz')
-lds <- ld %>% filter(BP_A > 28e6 & BP_A < 32e6 & BP_B > 28e6 & BP_B < 32e6)
-lds %>% ggplot(aes(x=as.factor(BP_A),y=as.factor(BP_B),fill=R2))+
-  geom_tile()+
-  theme_void()+
-  scale_fill_gradient(low='yellow',high='red')+
-  theme(axis.text.x = element_blank(),
-        axis.text.y = element_blank(),
-        axis.ticks.x = element_blank(),
-        axis.ticks.y = element_blank())+
-  geom_vline(xintercept = c(29.95e6, 31.2e6),col='blue')
 ```
 

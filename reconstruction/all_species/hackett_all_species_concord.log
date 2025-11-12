@@ -1,0 +1,24 @@
+IQ-TREE multicore version 2.2.0.3 COVID-edition for Linux 64-bit built May 11 2022
+Developed by Bui Quang Minh, James Barbetti, Nguyen Lam Tung,
+Olga Chernomor, Heiko Schmidt, Dominik Schrempf, Michael Woodhams, Ly Trong Nhan.
+
+Host:    hlegr1409n13 (AVX512, FMA3, 3023 GB RAM)
+Command: iqtree -t hackett_all_species_species_tree.tre --gcf hackett_all_species.tre --prefix hackett_all_species_concord
+Seed:    540564 (Using SPRNG - Scalable Parallel Random Number Generator)
+Time:    Tue Oct 14 01:07:09 2025
+Kernel:  AVX+FMA - 1 threads (3 CPU cores detected)
+
+HINT: Use -nt option to specify number of threads because your CPU has 3 cores!
+HINT: -nt AUTO will automatically determine the best number of threads to use.
+
+Reading tree hackett_all_species_species_tree.tre ...
+rooted tree with 55 taxa and 109 branches
+Reading tree(s) file hackett_all_species.tre ...
+5000 tree(s) loaded (5000 rooted and 0 unrooted)
+Computing gene concordance factor...
+1.020 sec
+Tree with concordance factors written to hackett_all_species_concord.cf.tree
+Annotated tree (best viewed in FigTree) written to hackett_all_species_concord.cf.tree.nex
+Tree with branch IDs written to hackett_all_species_concord.cf.branch
+Concordance factors per branch printed to hackett_all_species_concord.cf.stat
+Date and Time: Tue Oct 14 01:07:11 2025
