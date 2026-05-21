@@ -13,19 +13,41 @@ NPOP3
 0
 0
 //Number of migration matrices : 0 implies no migration between demes
-2
+5
 //Migration matrix 0
+0 0 0
+0 0 0
+0 0 0
+//Migration matrix 1
 0 MIG01 0
 MIG10 0 MIG12
 0 MIG21 0
-//Migration matrix 1
+//Migration matrix 2
+0 0 0
+0 0 0
+0 0 0
+//Migration matrix 3
+0 0 MIGA0A2
+0 0 0
+MIGA2A0 0 0
+//Migration matrix 4
 0 0 0
 0 0 0
 0 0 0
 //historical event: time, source, sink, migrants, new deme size, new growth rate, migration matrix index
-2 historical event
-TDIV1 1 0 1 NANC1 0 1 absoluteResize
-TDIV2 2 0 1 NANC2 0 1 absoluteResize
+12 historical event
+TMIG1S 0 0 0 1 0 1
+TMIG1S 1 1 0 1 0 1
+TMIG1S 2 2 0 1 0 1
+TMIG1E 0 0 0 1 0 2
+TMIG1E 1 1 0 1 0 2
+TMIG1E 2 2 0 1 0 2
+TDIV1 1 0 1 NANC1 0 2 absoluteResize
+TMIG2S 0 0 0 1 0 3
+TMIG2S 2 2 0 1 0 3
+TMIG2E 0 0 0 1 0 4
+TMIG2E 2 2 0 1 0 4
+TDIV2 2 0 1 NANC2 0 4 absoluteResize
 //Number of independent loci [chromosome] 
 1 0
 //Per chromosome: Number of contiguous linkage Block: a block is a set of contiguous loci
